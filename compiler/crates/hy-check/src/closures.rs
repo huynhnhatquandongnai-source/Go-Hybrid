@@ -1784,6 +1784,33 @@ fn update_pre_defer_peers(
                 }
             }
         }
+        Stmt::Match { subject, arms, .. } => {
+            let mut refs = Vec::new();
+            expr_referenced_bindings(subject, &mut refs);
+            for arm in arms {
+                if let hy_syntax::MatchPattern::Path {
+                    binding: Some(b), ..
+                } = &arm.pattern
+                {
+                    if b == "_" {
+                        continue;
+                    }
+                    let self_read = ck.value_reads_storage_of(st, subject, b);
+                    if !self_read {
+                        sever_peer_node(peers, b);
+                    }
+                    for r in &refs {
+                        let may_share = ck
+                            .lookup_binding(st, r)
+                            .map(|bind| ck.shape_may_share(&bind.shape))
+                            .unwrap_or(true);
+                        if may_share {
+                            link_peer_nodes(peers, b, r);
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1836,6 +1863,16 @@ fn update_post_defer_watch(
                 }
             }
         }
+        Stmt::Match { subject, arms, .. } => {
+            for arm in arms {
+                if let hy_syntax::MatchPattern::Path {
+                    binding: Some(b), ..
+                } = &arm.pattern
+                {
+                    handle_bind(b, Some(subject));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1867,8 +1904,33 @@ fn stmt_moves_watched_binding(
         None
     };
 
+    let check_direct_move_value =
+        |value: &Expr, span: hy_diagnostics::Span, desc: &str| -> Option<crate::model::MoveInfo> {
+            let inner = crate::model::unwrap_parens(value);
+            let moved_name = match inner {
+                Expr::Ident { name, .. } => Some(name.as_str()),
+                Expr::Field { .. } => inner.root_ident(),
+                _ => None,
+            };
+            if let Some(n) = moved_name {
+                if watch.contains(n) {
+                    return Some(crate::model::MoveInfo {
+                        span,
+                        kind: crate::model::MoveKind::Moved,
+                        desc: desc.to_string(),
+                        moved_name: n.to_string(),
+                    });
+                }
+            }
+            None
+        };
+
     match stmt {
-        Stmt::Task { args, .. } => {
+        Stmt::Task { callee, args, .. } => {
+            let callee_desc = format!("the spawn callee `{}`", callee.render());
+            if let Some(mv) = check_expr(callee, callee_desc) {
+                return Some(mv);
+            }
             for a in args {
                 let desc = format!("the spawn argument `{}`", a.value.render());
                 if let Some(mv) = check_expr(&a.value, desc) {
@@ -1892,18 +1954,14 @@ fn stmt_moves_watched_binding(
                 }
             );
             if *is_move {
-                if let Expr::Ident { name, .. } = crate::model::unwrap_parens(value) {
-                    if watch.contains(name) {
-                        return Some(crate::model::MoveInfo {
-                            span: *span,
-                            kind: crate::model::MoveKind::Moved,
-                            desc,
-                            moved_name: name.to_string(),
-                        });
-                    }
+                if let Some(mv) = check_direct_move_value(value, *span, &desc) {
+                    return Some(mv);
                 }
             }
-            if let Some(mv) = check_expr(value, desc) {
+            if let Some(mv) = check_expr(value, desc.clone()) {
+                return Some(mv);
+            }
+            if let Some(mv) = check_expr(chan, desc) {
                 return Some(mv);
             }
         }
@@ -1933,18 +1991,92 @@ fn stmt_moves_watched_binding(
         }
         Stmt::Select { arms, .. } => {
             for arm in arms {
-                if let SelectArmKind::Send { chan, value, .. } = &arm.kind {
-                    let desc = format!(
-                        "the select move-send `{} <- {}`",
-                        chan.render(),
-                        value.render()
-                    );
-                    if let Some(mv) = check_expr(value, desc) {
-                        return Some(mv);
+                match &arm.kind {
+                    SelectArmKind::Send {
+                        chan,
+                        value,
+                        is_move,
+                    } => {
+                        let desc = format!(
+                            "the select move-send `{} <- {}`",
+                            chan.render(),
+                            if *is_move && !matches!(value, Expr::Move { .. }) {
+                                format!("move {}", value.render())
+                            } else {
+                                value.render()
+                            }
+                        );
+                        if *is_move {
+                            if let Some(mv) = check_direct_move_value(value, arm.span, &desc) {
+                                return Some(mv);
+                            }
+                        }
+                        if let Some(mv) = check_expr(value, desc.clone()) {
+                            return Some(mv);
+                        }
+                        if let Some(mv) = check_expr(chan, desc) {
+                            return Some(mv);
+                        }
                     }
+                    SelectArmKind::Recv { chan, .. } => {
+                        let desc = format!("the select receive `<-{}`", chan.render());
+                        if let Some(mv) = check_expr(chan, desc) {
+                            return Some(mv);
+                        }
+                    }
+                    SelectArmKind::Default => {}
                 }
             }
         }
+        Stmt::Expr { expr, .. } => {
+            let desc = format!("the expression `{}`", expr.render());
+            if let Some(mv) = check_expr(expr, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::Defer { call, .. } => {
+            let desc = format!("the deferred call `{}`", call.render());
+            if let Some(mv) = check_expr(call, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::If { cond, .. } => {
+            let desc = format!("the condition `{}`", cond.render());
+            if let Some(mv) = check_expr(cond, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::Match { subject, .. } => {
+            let desc = format!("the match subject `{}`", subject.render());
+            if let Some(mv) = check_expr(subject, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::For { kind, .. } => match kind {
+            hy_syntax::ForKind::While { cond } => {
+                let desc = format!("the loop condition `{}`", cond.render());
+                if let Some(mv) = check_expr(cond, desc) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::Range { lo, hi, .. } => {
+                let desc_lo = format!("the range bound `{}`", lo.render());
+                if let Some(mv) = check_expr(lo, desc_lo) {
+                    return Some(mv);
+                }
+                let desc_hi = format!("the range bound `{}`", hi.render());
+                if let Some(mv) = check_expr(hi, desc_hi) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::Iterate { expr, .. } => {
+                let desc = format!("the loop iterable `{}`", expr.render());
+                if let Some(mv) = check_expr(expr, desc) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::Forever => {}
+        },
         _ => {}
     }
     None

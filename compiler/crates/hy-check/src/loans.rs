@@ -337,7 +337,7 @@ impl<'a> Checker<'a> {
                 &l.target,
                 LoanTarget::Handle { handle } if a3_paths_conflict(st, handle, root)
             ) && l.created <= idx
-                && idx <= l.last
+                && idx <= self.effective_loan_last(st, l)
         });
         let Some(loan) = conflict else { return };
         let msg = format!("mutating call on `{}` while a borrow loan is live", root);
@@ -532,7 +532,7 @@ impl<'a> Checker<'a> {
                     && a3_paths_conflict(st, p, path)
                     && !matches!((k.as_deref(), key), (Some(a), Some(b)) if a != b))
                 && l.created <= idx
-                && idx <= l.last
+                && idx <= self.effective_loan_last(st, l)
         }) else {
             return;
         };
@@ -2602,7 +2602,7 @@ impl<'a> Checker<'a> {
                 .filter_map(|l| match &l.target {
                     LoanTarget::MapSlot { binding, path, key }
                         if l.created <= idx
-                            && idx <= l.last
+                            && idx <= self.effective_loan_last(st, l)
                             && a3_paths_conflict(st, path, &src) =>
                     {
                         Some(Loan {
@@ -2612,7 +2612,22 @@ impl<'a> Checker<'a> {
                                 key: key.clone(),
                             },
                             created: l.created,
-                            last: l.last,
+                            last: self.effective_loan_last(st, l),
+                            span: l.span,
+                            desc: l.desc.clone(),
+                        })
+                    }
+                    LoanTarget::Handle { handle }
+                        if l.created <= idx
+                            && idx <= self.effective_loan_last(st, l)
+                            && a3_paths_conflict(st, handle, &src) =>
+                    {
+                        Some(Loan {
+                            target: LoanTarget::Handle {
+                                handle: name.to_string(),
+                            },
+                            created: l.created,
+                            last: self.effective_loan_last(st, l),
                             span: l.span,
                             desc: l.desc.clone(),
                         })
@@ -3891,10 +3906,17 @@ impl<'a> Checker<'a> {
                 .unwrap_or(false);
             if is_borrow_src {
                 let group = st.share_group(&src);
+                let loop_end = st.loop_end.clone();
                 for loan in st.loans.iter_mut() {
                     if let LoanTarget::Handle { handle } = &loan.target {
+                        let mut eff_last = loan.last;
+                        for (&lp_idx, &lp_end) in &loop_end {
+                            if loan.created < lp_end && eff_last >= lp_idx && eff_last <= lp_end {
+                                eff_last = eff_last.max(lp_end);
+                            }
+                        }
                         if loan.created <= idx
-                            && idx <= loan.last
+                            && idx <= eff_last
                             && (handle == &src || group.contains(handle))
                         {
                             loan.last = loan.last.max(view_last);

@@ -223,7 +223,7 @@ impl<'a> Checker<'a> {
                 recv,
             } => {
                 self.check_call_const_writes(st, cr, &HashSet::new());
-                self.record_callee_param_stores(st, cr);
+                self.record_callee_param_stores(st, cr, idx);
                 let Some(tname) = receiver_type_name(&recv) else {
                     self.check_a3_method_call(st, cr, idx, &root, &recv, &method);
                     return;
@@ -282,7 +282,7 @@ impl<'a> Checker<'a> {
                 // share it afterwards — a later `move` of either must freeze
                 // the other (O5.2). Primitive-element slices share nothing.
                 if name == "copy" {
-                    self.record_copy_may_share(st, cr);
+                    self.record_copy_may_share(st, cr, idx);
                 }
                 if name == "delete" || name == "clear" {
                     // A3: map delete / clear is a map mutation
@@ -296,7 +296,7 @@ impl<'a> Checker<'a> {
                     self.check_delete_const(st, cr, &HashSet::new());
                 }
                 self.check_call_const_writes(st, cr, &HashSet::new());
-                self.record_callee_param_stores(st, cr);
+                self.record_callee_param_stores(st, cr, idx);
                 if self.fns.contains_key(&name) {
                     // A3 #111: the callee may insert/delete through the
                     // argument — that event runs inside THIS call site's
@@ -323,7 +323,7 @@ impl<'a> Checker<'a> {
             }
             Resolved::None => {
                 self.check_call_const_writes(st, cr, &HashSet::new());
-                self.record_callee_param_stores(st, cr);
+                self.record_callee_param_stores(st, cr, idx);
                 self.check_a3_inline_or_unknown_call(st, cr, idx);
             }
         }
@@ -2631,7 +2631,7 @@ impl<'a> Checker<'a> {
     /// binding must freeze the other (O5.2). A primitive-element slice
     /// (`[]int`) copies by value and shares nothing, so no edge is recorded
     /// and the positive control stays accepted.
-    pub(crate) fn record_copy_may_share(&self, st: &mut FnState, cr: &CallRef) {
+    pub(crate) fn record_copy_may_share(&self, st: &mut FnState, cr: &CallRef, idx: usize) {
         let (Some(dst), Some(src)) = (cr.args.first(), cr.args.get(1)) else {
             return;
         };
@@ -2651,25 +2651,46 @@ impl<'a> Checker<'a> {
         }
         let mut dst_roots = Vec::new();
         collect_ref_roots(&dst.value, &mut dst_roots);
+        collect_addr_of_roots(&dst.value, &mut dst_roots);
+        collect_move_ident_sources(&dst.value, &mut dst_roots);
         let mut src_roots = Vec::new();
         collect_ref_roots(&src.value, &mut src_roots);
+        collect_addr_of_roots(&src.value, &mut src_roots);
+        collect_move_ident_sources(&src.value, &mut src_roots);
         for d in &dst_roots {
+            if !self.binding_may_share(st, d) {
+                continue;
+            }
+            self.record_move_const_and_a3_loans(st, d, &src.value, idx);
             for s in &src_roots {
-                if d != s && self.binding_may_share(st, d) && self.binding_may_share(st, s) {
+                if d != s
+                    && (self.binding_may_share(st, s)
+                        || self.lookup_binding(st, s).is_some_and(|b| b.immutable)
+                        || self.consts.contains_key(s))
+                {
                     st.share_edge(d, s);
                 }
             }
         }
-        if let Some(origin) = self.moved_non_owned_origin_in_expr(st, &src.value) {
+        let src_origin = self
+            .moved_non_owned_origin_in_expr(st, &src.value)
+            .or_else(|| {
+                src_roots
+                    .iter()
+                    .find_map(|s| self.non_owned_origin_of(st, s).map(|(o, _)| o))
+            });
+        if let Some(origin) = src_origin {
             let peer_origin = if origin.starts_with("a may-share peer of ") {
                 origin
             } else {
                 format!("a may-share peer of {}", origin)
             };
             for d in &dst_roots {
-                if let Some(db) = st.env_lookup_mut(d) {
-                    if db.non_owned_origin.is_none() {
-                        db.non_owned_origin = Some(peer_origin.clone());
+                if self.binding_may_share(st, d) {
+                    if let Some(db) = st.env_lookup_mut(d) {
+                        if db.non_owned_origin.is_none() {
+                            db.non_owned_origin = Some(peer_origin.clone());
+                        }
                     }
                 }
             }
@@ -2688,7 +2709,7 @@ impl<'a> Checker<'a> {
     /// binding freezes the other (O5.2, `HYB-E3003`) and cannot launder a
     /// non-owned parameter/capture/const across a concurrency boundary
     /// (O5.1 / O5.4, `HYB-E3004`; T22, `HYB-E3006`).
-    pub(crate) fn record_callee_param_stores(&self, st: &mut FnState, cr: &CallRef) {
+    pub(crate) fn record_callee_param_stores(&self, st: &mut FnState, cr: &CallRef, idx: usize) {
         let Some((slots, body)) = self.resolve_callee_slots_and_body(st, cr) else {
             return;
         };
@@ -2714,6 +2735,7 @@ impl<'a> Checker<'a> {
                 CalleeSlotSource::Arg(dst_expr) => {
                     collect_ref_roots(dst_expr, &mut dst_roots);
                     collect_addr_of_roots(dst_expr, &mut dst_roots);
+                    collect_move_ident_sources(dst_expr, &mut dst_roots);
                 }
                 CalleeSlotSource::OuterBinding(name) => {
                     dst_roots.push(name.clone());
@@ -2734,7 +2756,17 @@ impl<'a> Checker<'a> {
                             src_roots.push(r.to_string());
                         }
                     }
+                    for d in &dst_roots {
+                        if self.binding_may_share(st, d) {
+                            self.record_move_const_and_a3_loans(st, d, src_expr, idx);
+                        }
+                    }
                     self.moved_non_owned_origin_in_expr(st, src_expr)
+                        .or_else(|| {
+                            src_roots
+                                .iter()
+                                .find_map(|s| self.non_owned_origin_of(st, s).map(|(o, _)| o))
+                        })
                 }
                 CalleeSlotSource::OuterBinding(name) => {
                     src_roots.push(name.clone());
@@ -2754,7 +2786,8 @@ impl<'a> Checker<'a> {
                 for s in &src_roots {
                     if d != s
                         && (self.binding_may_share(st, s)
-                            || self.lookup_binding(st, s).is_some_and(|b| b.immutable))
+                            || self.lookup_binding(st, s).is_some_and(|b| b.immutable)
+                            || self.consts.contains_key(s))
                     {
                         st.share_edge(d, s);
                     }
@@ -8629,5 +8662,60 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn copy_and_callee_param_stores_propagate_const_a3_and_non_owned_origin() {
+        let src_copy_move_const = "\
+const K = []map[string]int{{\"a\": 1}}
+
+fn main() {
+    dst := []map[string]int{{}}
+    copy(dst, move K)
+    dst[0][\"a\"] = 99
 }
+";
+        assert!(
+            check_codes(src_copy_move_const).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 for copy(dst, move K) followed by mutation through dst"
+        );
+
+        let src_copy_param_rebound = "\
+fn run(p []map[string]int, ch chan []map[string]int) {
+    dst := []map[string]int{{}}
+    copy(dst, p)
+    p = []map[string]int{}
+    _ = p
+    ch <- move dst
+}
+";
+        assert!(
+            check_codes(src_copy_param_rebound).iter().any(|c| c == "HYB-E3004"),
+            "expected HYB-E3004 when moving dst after copy(dst, p) even if p is rebound"
+        );
+
+        let src_callee_store_a3 = "\
+struct svc {
+    count int
+}
+
+fn stash(dst []map[string]svc, src map[string]svc) {
+    dst[0] = src
+}
+
+fn main() {
+    m := map[string]svc{\"a\": svc{count: 1}}
+    s := &m[\"a\"]
+    dst := []map[string]svc{{}}
+    stash(dst, move m)
+    dst[0][\"b\"] = svc{count: 2}
+    s.count = 99
+}
+";
+        assert!(
+            check_codes(src_callee_store_a3).iter().any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 when callee stores moved map with live A3 slot loan into dst"
+        );
+    }
+}
+
 

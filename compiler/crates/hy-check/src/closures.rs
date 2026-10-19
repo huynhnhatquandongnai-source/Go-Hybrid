@@ -64,6 +64,7 @@ struct NestedClosure<'a> {
     params: &'a [hy_syntax::Param],
     results: &'a [hy_syntax::FnResult],
     body: &'a Block,
+    saved_env: std::collections::HashMap<String, Binding>,
     saved_scopes: Vec<std::collections::HashMap<String, Binding>>,
     saved_aliases: std::collections::HashMap<String, String>,
     saved_share: std::collections::HashMap<String, std::collections::HashSet<String>>,
@@ -81,6 +82,7 @@ fn push_nested_closure<'a>(
         params,
         results,
         body,
+        saved_env: st.env.clone(),
         saved_scopes: st.scopes.clone(),
         saved_aliases: st.aliases.clone(),
         saved_share: st.may_share.clone(),
@@ -110,6 +112,15 @@ fn is_overwritten_in_nc(st: &FnState, nc: &NestedClosure<'_>, name: &str) -> boo
 
 fn sync_nested_moves(st: &FnState, nested: &mut [NestedClosure<'_>]) {
     for nc in nested.iter_mut() {
+        for (k, b) in &st.env {
+            if !nc.overwritten.iter().any(|(_, n)| n == k) {
+                if let Some(sb) = nc.saved_env.get_mut(k) {
+                    if sb.moved.is_none() && b.moved.is_some() {
+                        sb.moved = b.moved.clone();
+                    }
+                }
+            }
+        }
         for (depth, scope) in st.scopes.iter().enumerate() {
             if depth < nc.saved_scopes.len() {
                 for (k, b) in scope {
@@ -126,6 +137,8 @@ fn sync_nested_moves(st: &FnState, nested: &mut [NestedClosure<'_>]) {
         for (k, v) in &st.aliases {
             if !is_overwritten_in_nc(st, nc, k) && !is_overwritten_in_nc(st, nc, v) {
                 nc.saved_aliases.entry(k.clone()).or_insert_with(|| v.clone());
+                nc.saved_share.entry(k.clone()).or_default().insert(v.clone());
+                nc.saved_share.entry(v.clone()).or_default().insert(k.clone());
             }
         }
         for (k, vs) in &st.may_share {
@@ -175,12 +188,21 @@ fn sync_nested_moves(st: &FnState, nested: &mut [NestedClosure<'_>]) {
                 }
             }
             for member in seen {
+                let mut updated = false;
                 for scope in nc.saved_scopes.iter_mut().rev() {
                     if let Some(sb) = scope.get_mut(&member) {
                         if sb.moved.is_none() {
                             sb.moved = Some(mv.clone());
                         }
+                        updated = true;
                         break;
+                    }
+                }
+                if !updated {
+                    if let Some(sb) = nc.saved_env.get_mut(&member) {
+                        if sb.moved.is_none() {
+                            sb.moved = Some(mv.clone());
+                        }
                     }
                 }
             }
@@ -272,6 +294,15 @@ fn check_one_closure(
     sync_nested_moves(&cst, &mut nested);
     for nc in nested {
         let mut snap = cst.clone();
+        for (k, sb) in nc.saved_env {
+            if let Some(mv) = sb.moved {
+                if let Some(eb) = snap.env.get_mut(&k) {
+                    if eb.moved.is_none() {
+                        eb.moved = Some(mv);
+                    }
+                }
+            }
+        }
         snap.scopes = nc.saved_scopes;
         // A nested closure checks against ITS OWN named results: reset the
         // enclosing closure's seeded state, check_one_closure re-seeds from
@@ -694,6 +725,9 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     Option<String>,
                     Option<String>,
                     Vec<String>,
+                    Vec<String>,
+                    std::collections::HashSet<(String, usize)>,
+                    Option<usize>,
                 )> = l
                     .names
                     .iter()
@@ -729,6 +763,20 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                         } else {
                             None
                         };
+                        let prior_children: Vec<String> = if reads_self {
+                            st.aliases
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    if v == name && k != name {
+                                        Some(k.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let prior_shares: Vec<String> = if reads_self {
                             st.may_share
                                 .get(name)
@@ -737,6 +785,20 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                         } else {
                             Vec::new()
                         };
+                        let prior_shadow_links = if reads_self {
+                            st.shadow_links.get(name).cloned().unwrap_or_default()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
+                        let outer_depth = if st
+                            .scopes
+                            .last()
+                            .is_some_and(|top| !top.contains_key(name))
+                        {
+                            st.lookup_depth(name)
+                        } else {
+                            None
+                        };
                         (
                             name.clone(),
                             shape,
@@ -744,7 +806,10 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             reads_self,
                             shadowed_origin,
                             prior_alias,
+                            prior_children,
                             prior_shares,
+                            prior_shadow_links,
+                            outer_depth,
                         )
                     })
                     .collect();
@@ -757,16 +822,40 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     reads_self,
                     shadowed_origin,
                     prior_alias,
+                    prior_children,
                     prior_shares,
+                    prior_shadow_links,
+                    outer_depth,
                 ) in resolved
                 {
                     overwritten.push(name.clone());
                     let carries = ck.shape_may_share(&shape);
-                    mark_nested_overwritten(st, &name, nested);
+                    if !reads_self {
+                        mark_nested_overwritten(st, &name, nested);
+                    }
                     ck.define_binding(st, &name, shape.clone(), ty, immutable, managed, is_let);
                     if reads_self {
+                        if !prior_shadow_links.is_empty() {
+                            st.shadow_links
+                                .entry(name.clone())
+                                .or_default()
+                                .extend(prior_shadow_links);
+                        }
+                        if let Some(depth) = outer_depth {
+                            st.shadow_links
+                                .entry(name.clone())
+                                .or_default()
+                                .insert((name.clone(), depth));
+                        }
                         if let Some(pa) = prior_alias {
-                            st.aliases.insert(name.clone(), pa);
+                            if pa != name {
+                                st.aliases.insert(name.clone(), pa);
+                            }
+                        }
+                        for child in prior_children {
+                            if child != name {
+                                st.aliases.insert(child, name.clone());
+                            }
                         }
                         for peer in prior_shares {
                             st.share_edge(&name, &peer);
@@ -1137,6 +1226,39 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             sync_nested_moves(st, nested);
             collect_stmt_direct_fnlits(stmt, st, nested);
             ck.process_closure_assign(st, targets, *op, values);
+            if *op == hy_syntax::AssignOp::Assign {
+                let cdefs: Vec<(String, Vec<hy_syntax::Param>, Vec<hy_syntax::FnResult>, Block)> =
+                    st.closure_defs
+                        .iter()
+                        .map(|(k, (p, r, b))| (k.clone(), p.clone(), r.clone(), b.clone()))
+                        .collect();
+                for t in targets {
+                    if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                        if ck.binding_may_share(st, name) {
+                            for (c_name, c_params, c_results, c_body) in &cdefs {
+                                if c_name != name
+                                    && !c_params.iter().any(|p| &p.name == name)
+                                    && !c_results
+                                        .iter()
+                                        .any(|r| r.name.as_deref() == Some(name.as_str()))
+                                {
+                                    let mut refs = Vec::new();
+                                    for s in &c_body.stmts {
+                                        let mut uses = Vec::new();
+                                        crate::walk::own_uses(s, &mut uses);
+                                        for u in uses {
+                                            refs.push(u.name);
+                                        }
+                                    }
+                                    if refs.iter().any(|r| r == name) {
+                                        st.share_edge(c_name, name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             sync_nested_moves(st, nested);
             if targets.len() == values.len() {
                 for (t, v) in targets.iter().zip(values.iter()) {
@@ -2098,4 +2220,62 @@ fn main() {
 "#;
         assert_eq!(codes(src), vec!["HYB-E3003"]);
     }
+
+    #[test]
+    fn reject_closure_multival_shadow_and_nested_rebind_issue_821() {
+        let src1 = r#"fn dup(m map[string]int) (map[string]int, bool) {
+    return m, true
 }
+
+fn worker(owned map[string]int, done chan bool) {
+    owned["worker"] = 1
+    done <- true
+}
+
+fn main() {
+    done := make(chan bool, 1)
+    f := fn() {
+        m := map[string]int{"init": 0}
+        if true {
+            m, ok := dup(m)
+            _ = ok
+            m2 := m
+            m = map[string]int{"fresh": 0}
+            _ = m
+            task worker(move m2, done)
+        }
+        m["main"] = 2
+    }
+    f()
+    <-done
+}
+"#;
+        assert_eq!(codes(src1), vec!["HYB-E3003"]);
+
+        let src2 = r#"fn worker(owned map[string]int, done chan bool) {
+    owned["worker"] = 1
+    done <- true
+}
+
+fn main() {
+    done := make(chan bool, 1)
+    f := fn() {
+        m := map[string]int{"init": 0}
+        g := fn() {
+            m["g"] = 1
+        }
+        m2 := map[string]int{"shared": 1}
+        m = m2
+        task worker(move m2, done)
+        g()
+        m = map[string]int{"fresh": 2}
+        _ = m
+    }
+    f()
+    <-done
+}
+"#;
+        assert!(codes(src2).contains(&"HYB-E3003".to_string()));
+    }
+}
+

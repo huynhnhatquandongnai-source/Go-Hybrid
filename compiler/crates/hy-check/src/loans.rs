@@ -313,6 +313,9 @@ impl<'a> Checker<'a> {
                         // A3 #111 form 4: a local closure whose body mutates a
                         // captured binding — event attributed to this call site.
                         self.check_a3_closure_call(st, cr, idx, &name);
+                        if !cr.args.is_empty() {
+                            self.check_a3_unknown_call_args(st, cr, idx);
+                        }
                     } else if !A3_PURE_FNS.contains(&name.as_str()) && name != "delete" {
                         // Unresolved callee (e.g. a `fn(...)` parameter or local
                         // function variable): fail-closed on any map argument
@@ -856,6 +859,11 @@ impl<'a> Checker<'a> {
                         }
                     }
                     for v in values {
+                        if let Some(root) = walk::addr_of_index_base_path(v) {
+                            if alias_stack.last().unwrap().contains(&root) {
+                                return true;
+                            }
+                        }
                         if alias_stack.last().unwrap().iter().any(|p| self.expr_fnlit_mutates_param(v, p, depth)) {
                             return true;
                         }
@@ -863,6 +871,11 @@ impl<'a> Checker<'a> {
                 }
                 Stmt::Local(l) => {
                     for v in &l.values {
+                        if let Some(root) = walk::addr_of_index_base_path(v) {
+                            if alias_stack.last().unwrap().contains(&root) {
+                                return true;
+                            }
+                        }
                         if alias_stack.last().unwrap().iter().any(|p| self.expr_fnlit_mutates_param(v, p, depth)) {
                             return true;
                         }
@@ -1005,10 +1018,37 @@ impl<'a> Checker<'a> {
                 // passing the parameter fails closed
                 cr.args.iter().any(&arg_root_is_param)
             }
-            Expr::Field { base, .. } => {
+            Expr::Field {
+                base,
+                name: method_name,
+                ..
+            } => {
                 if let Expr::Ident { name: pkg, .. } = &**base {
                     if A3_PURE_PKGS.contains(&pkg.as_str()) {
                         return false;
+                    }
+                }
+                let mut base_roots = Vec::new();
+                collect_ref_roots(base, &mut base_roots);
+                collect_addr_of_roots(base, &mut base_roots);
+                if base_roots.iter().any(|r| r == param) {
+                    let mut matched_method = false;
+                    let mut receiver_mutates = false;
+                    for ((_, m), decl) in &self.method_decls {
+                        if m == method_name {
+                            matched_method = true;
+                            if decl
+                                .receiver
+                                .as_ref()
+                                .is_some_and(|r| self.fn_mutates_param(decl, &r.name, depth + 1))
+                            {
+                                receiver_mutates = true;
+                                break;
+                            }
+                        }
+                    }
+                    if receiver_mutates || !matched_method {
+                        return true;
                     }
                 }
                 cr.args.iter().any(&arg_root_is_param)
@@ -1266,8 +1306,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            // FnLit values bound/rebound in this block (captures mutated by
-            // nested closures — flatten does not descend into FnLit bodies)
+            // FnLit values and O8 map-slot loans bound/rebound in this block
             let mut fnlit_values: Vec<&Expr> = Vec::new();
             match stmt {
                 Stmt::Local(l) => fnlit_values.extend(l.values.iter()),
@@ -1275,6 +1314,11 @@ impl<'a> Checker<'a> {
                 _ => {}
             }
             for v in fnlit_values {
+                if let Some(raw) = walk::addr_of_index_base_path(v) {
+                    if let Some(r) = resolve(&raw, current_aliases, current_shadows) {
+                        out.insert(r);
+                    }
+                }
                 if let Expr::FnLit {
                     params: fp,
                     results: fr,
@@ -1352,10 +1396,39 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
-                    Expr::Field { base, .. } => {
+                    Expr::Field {
+                        base,
+                        name: method_name,
+                        ..
+                    } => {
                         if let Expr::Ident { name: pkg, .. } = &**base {
                             if A3_PURE_PKGS.contains(&pkg.as_str()) {
                                 continue;
+                            }
+                        }
+                        let mut base_roots = Vec::new();
+                        collect_ref_roots(base, &mut base_roots);
+                        collect_addr_of_roots(base, &mut base_roots);
+                        let mut matched_method = false;
+                        let mut receiver_mutates = false;
+                        for ((_, m), decl) in &self.method_decls {
+                            if m == method_name {
+                                matched_method = true;
+                                if decl
+                                    .receiver
+                                    .as_ref()
+                                    .is_some_and(|r| self.fn_mutates_param(decl, &r.name, 0))
+                                {
+                                    receiver_mutates = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if receiver_mutates || !matched_method {
+                            for root in base_roots {
+                                if let Some(r) = resolve(&root, current_aliases, current_shadows) {
+                                    out.insert(r);
+                                }
                             }
                         }
                         for a in cr.args {

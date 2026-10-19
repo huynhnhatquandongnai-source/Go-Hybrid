@@ -38,6 +38,7 @@ pub(crate) enum ScopeEvent<'a> {
     MatchBind {
         name: &'a str,
         subject: &'a Expr,
+        guard: Option<&'a Expr>,
     },
 }
 
@@ -215,6 +216,7 @@ fn walk_one<'a>(out: &mut FlatInfo<'a>, stmt: &'a Stmt, named_results: &[String]
                                 ScopeEvent::MatchBind {
                                     name: name.as_str(),
                                     subject,
+                                    guard: arm.guard.as_ref(),
                                 },
                             );
                         }
@@ -572,13 +574,8 @@ pub(crate) fn own_calls<'a>(stmt: &'a Stmt, out: &mut Vec<CallRef<'a>>) {
             }
         }
         Stmt::Managed { .. } => {}
-        Stmt::Match { subject, arms, .. } => {
+        Stmt::Match { subject, .. } => {
             expr_calls(subject, out);
-            for arm in arms {
-                if let Some(g) = &arm.guard {
-                    expr_calls(g, out);
-                }
-            }
         }
         Stmt::Defer { call, .. } => expr_calls(call, out),
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -640,13 +637,8 @@ pub(crate) fn own_fnlits<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
             }
         }
         Stmt::Managed { .. } => {}
-        Stmt::Match { subject, arms, .. } => {
+        Stmt::Match { subject, .. } => {
             expr_fnlits(subject, out);
-            for arm in arms {
-                if let Some(g) = &arm.guard {
-                    expr_fnlits(g, out);
-                }
-            }
         }
         Stmt::Defer { call, .. } => expr_fnlits(call, out),
         Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Block { .. } => {}

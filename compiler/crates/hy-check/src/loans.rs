@@ -5947,7 +5947,7 @@ impl<'a> Checker<'a> {
                                 self.define_binding(&mut cst, n, shape, None, false, false, false);
                             }
                         }
-                        walk::ScopeEvent::MatchBind { name, subject } => {
+                        walk::ScopeEvent::MatchBind { name, subject, .. } => {
                             // pr-244 (#243): match-arm `some(v)` bindings
                             // inherit the subject's const-root state — a
                             // binding over a const composite freezes like the
@@ -6202,6 +6202,103 @@ impl<'a> Checker<'a> {
                     }
                     _ => {}
                 },
+                Stmt::Match { subject, arms, .. } => {
+                    for arm in arms {
+                        if let Some(g) = &arm.guard {
+                            cst.scope_push();
+                            if let hy_syntax::MatchPattern::Path {
+                                binding: Some(name),
+                                ..
+                            } = &arm.pattern
+                            {
+                                let mut roots = Vec::new();
+                                collect_ref_roots(subject, &mut roots);
+                                self.collect_callee_const_return_roots(
+                                    &cst,
+                                    subject,
+                                    &mut roots,
+                                    0,
+                                );
+                                let croot = roots.iter().find_map(|r| {
+                                    if self.lookup_binding(&cst, r).is_none() {
+                                        return None;
+                                    }
+                                    let p = Place {
+                                        kind: PlaceKind::Ident(r.clone()),
+                                        span: subject.span(),
+                                    };
+                                    self.const_write_root(&cst, &p)
+                                });
+                                if let Some(cr) = &croot {
+                                    if name == cr {
+                                        self.define_binding(
+                                            &mut cst,
+                                            name,
+                                            TypeShape::Unknown,
+                                            None,
+                                            true,
+                                            false,
+                                            false,
+                                        );
+                                    } else {
+                                        self.define_binding(
+                                            &mut cst,
+                                            name,
+                                            TypeShape::Unknown,
+                                            None,
+                                            false,
+                                            false,
+                                            false,
+                                        );
+                                        cst.aliases.insert(name.clone(), cr.clone());
+                                        cst.share_edge(name, cr);
+                                    }
+                                } else {
+                                    self.define_binding(
+                                        &mut cst,
+                                        name,
+                                        TypeShape::Unknown,
+                                        None,
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                                    cst.aliases.remove(name.as_str());
+                                    cst.share_clear(name);
+                                }
+                            }
+                            if check_writes {
+                                let mut g_calls = Vec::new();
+                                walk::expr_calls(g, &mut g_calls);
+                                for cr in &g_calls {
+                                    self.check_delete_const(&cst, cr, &HashSet::new());
+                                    self.check_call_const_writes(&cst, cr, &HashSet::new());
+                                }
+                            }
+                            let mut g_fnlits = Vec::new();
+                            walk::expr_fnlits(g, &mut g_fnlits);
+                            for flit in g_fnlits {
+                                let mut merged = cst.clone();
+                                for (k, v) in &st.aliases {
+                                    if !merged.scopes.iter().any(|s| s.contains_key(k)) {
+                                        merged.aliases.entry(k.clone()).or_insert_with(|| v.clone());
+                                    }
+                                }
+                                for (k, peers) in &st.may_share {
+                                    if !merged.scopes.iter().any(|s| s.contains_key(k)) {
+                                        for p in peers {
+                                            if !merged.scopes.iter().any(|s| s.contains_key(p)) {
+                                                merged.share_edge(k, p);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.scan_closure_body(&mut merged, flit, &HashSet::new());
+                            }
+                            cst.scope_pop();
+                        }
+                    }
+                }
                 _ => {}
             }
 
@@ -6905,6 +7002,9 @@ impl<'a> Checker<'a> {
                 aliases.extend(body_aliases);
             }
             Stmt::Match { subject, arms, .. } => {
+                if self.expr_fnlit_mutates_const_param(subject, aliases, depth) {
+                    return true;
+                }
                 let subject_reaches = Self::expr_reaches_const_aliases(subject, aliases);
                 for arm in arms {
                     let mut arm_aliases = aliases.clone();
@@ -6917,6 +7017,19 @@ impl<'a> Checker<'a> {
                             arm_aliases.insert(bname.clone());
                         } else {
                             arm_aliases.remove(bname);
+                        }
+                    }
+                    if let Some(g) = &arm.guard {
+                        if self.expr_fnlit_mutates_const_param(g, &arm_aliases, depth) {
+                            return true;
+                        }
+                        let mut g_calls = Vec::new();
+                        walk::expr_calls(g, &mut g_calls);
+                        for cr in &g_calls {
+                            if self.call_mutates_const_param(cr, &arm_aliases, depth) {
+                                return true;
+                            }
+                            self.record_call_const_alias_stores(cr, &mut arm_aliases);
                         }
                     }
                     if self.block_mutates_const_param(&arm.body, &mut arm_aliases, depth) {
@@ -7618,10 +7731,18 @@ fn collect_capture_idents_stmt(
         hy_syntax::Stmt::Match { subject, arms, .. } => {
             collect_capture_idents_expr(subject, bound, out);
             for arm in arms {
-                if let Some(g) = &arm.guard {
-                    collect_capture_idents_expr(g, bound, out);
+                let mut arm_bound = bound.clone();
+                if let hy_syntax::MatchPattern::Path {
+                    binding: Some(bname),
+                    ..
+                } = &arm.pattern
+                {
+                    arm_bound.insert(bname.clone());
                 }
-                collect_capture_idents_block(&arm.body, bound, out);
+                if let Some(g) = &arm.guard {
+                    collect_capture_idents_expr(g, &mut arm_bound, out);
+                }
+                collect_capture_idents_block(&arm.body, &mut arm_bound, out);
             }
         }
         hy_syntax::Stmt::Defer { call, .. } => collect_capture_idents_expr(call, bound, out),
@@ -8627,6 +8748,53 @@ fn main() {
         assert!(
             check_codes(src_a6).iter().any(|c| c == "HYB-E3103"),
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
+        );
+    }
+
+    #[test]
+    fn match_arm_guard_binds_pattern_before_guard_checks_issue_883() {
+        let src_const_mutate_in_guard = "\
+fn mutate(m map[string]int) bool {
+    m[\"k\"] = 99
+    return true
+}
+
+fn main() {
+    const c = some(map[string]int{\"k\": 1})
+    match c {
+        some(v) if mutate(v) => {}
+        _ => {}
+    }
+}
+";
+        assert!(
+            check_codes(src_const_mutate_in_guard)
+                .iter()
+                .any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when match arm guard mutates const composite through pattern binding"
+        );
+
+        let src_move_in_guard_then_use_in_body = "\
+fn take(m map[string]int) bool {
+    return len(m) > 0
+}
+
+fn main() {
+    m := map[string]int{\"k\": 1}
+    opt := some(m)
+    match opt {
+        some(v) if take(move v) => {
+            v[\"k\"] = 2
+        }
+        _ => {}
+    }
+}
+";
+        assert!(
+            check_codes(src_move_in_guard_then_use_in_body)
+                .iter()
+                .any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when match arm guard moves pattern binding and arm body uses it"
         );
     }
 }

@@ -1085,26 +1085,36 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             );
             sync_nested_moves(st, nested);
             collect_expr_direct_fnlits(subject, st, nested);
-            for arm in arms {
-                if let Some(g) = &arm.guard {
-                    ck.mark_move_in_value(
-                        st,
-                        g,
-                        format!("the match guard `{}`", g.render()),
-                    );
-                }
-            }
             ck.check_match(st, subject, arms, *span);
             for arm in arms {
                 st.scope_push();
-                if let hy_syntax::MatchPattern::Path {
+                let bound_name = if let hy_syntax::MatchPattern::Path {
                     binding: Some(name),
                     ..
                 } = &arm.pattern
                 {
                     ck.bind_match_arm(st, name, subject, managed);
-                }
+                    Some(name.as_str())
+                } else {
+                    None
+                };
                 if let Some(g) = &arm.guard {
+                    if let Some(bname) = bound_name {
+                        let mut g_uses = Vec::new();
+                        crate::walk::expr_uses(g, &mut g_uses);
+                        g_uses.retain(|u| u.name == bname);
+                        ck.check_uses(st, &g_uses);
+                    }
+                    let mut g_calls = Vec::new();
+                    crate::walk::expr_calls(g, &mut g_calls);
+                    for cr in &g_calls {
+                        if let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) {
+                            if name == "copy" {
+                                ck.record_copy_may_share(st, cr);
+                            }
+                        }
+                        ck.record_callee_param_stores(st, cr);
+                    }
                     ck.mark_move_in_value(
                         st,
                         g,

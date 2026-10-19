@@ -433,6 +433,9 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     let mut reported_backedge: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    let mut guard_moves: std::collections::HashMap<usize, model::MoveInfo> =
+        std::collections::HashMap::new();
+
     // Pass B: statements in source order.
     for (stmt, idx) in &flat.stmts {
         let stmt: &Stmt = stmt;
@@ -461,8 +464,19 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                             ck.define_binding(&mut st, n, shape, None, false, managed, false);
                         }
                     }
-                    walk::ScopeEvent::MatchBind { name, subject } => {
+                    walk::ScopeEvent::MatchBind {
+                        name,
+                        subject,
+                        guard,
+                    } => {
                         ck.bind_match_arm(&mut st, name, subject, managed);
+                        if let Some(g) = guard {
+                            if let Some(mv) = guard_moves.get(&(*g as *const Expr as usize)) {
+                                if let Some(b) = st.env_lookup_mut(name) {
+                                    b.moved = Some(mv.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -829,11 +843,61 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 );
                 for arm in arms {
                     if let Some(g) = &arm.guard {
+                        st.scope_push();
+                        let bound_name = match &arm.pattern {
+                            hy_syntax::MatchPattern::Path {
+                                binding: Some(name),
+                                ..
+                            } => {
+                                ck.bind_match_arm(&mut st, name, subject, managed);
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        };
+                        let mut g_uses = Vec::new();
+                        walk::expr_uses(g, &mut g_uses);
+                        if let Some(bname) = bound_name {
+                            g_uses.retain(|u| u.name == bname);
+                            ck.check_uses(&st, &g_uses);
+                            ck.check_addr_of_loan(&st, &g_uses);
+                        }
+                        let mut g_fnlits = Vec::new();
+                        walk::expr_fnlits(g, &mut g_fnlits);
+                        if !g_fnlits.is_empty() {
+                            if let Some(top) = st.fnlit_scopes.last_mut() {
+                                for fl in g_fnlits {
+                                    let sp = fl.span();
+                                    top.push((sp.start.line as usize, sp.start.col as usize));
+                                }
+                            }
+                        }
+                        let mut g_calls = Vec::new();
+                        walk::expr_calls(g, &mut g_calls);
+                        let mut g_consumes = Vec::new();
+                        for cr in g_calls {
+                            ck.process_call(&mut st, &cr, idx, None, &mut g_consumes);
+                        }
+                        if !g_consumes.is_empty() {
+                            let mut all_g_uses = Vec::new();
+                            walk::expr_uses(g, &mut all_g_uses);
+                            ck.check_same_stmt_consumes(&st, &all_g_uses, &g_consumes);
+                        }
                         ck.mark_move_in_value(
                             &mut st,
                             g,
                             format!("the match guard `{}`", g.render()),
                         );
+                        if let Some(bname) = bound_name {
+                            if let Some(mv) = st
+                                .scopes
+                                .last()
+                                .and_then(|s| s.get(bname))
+                                .and_then(|b| b.moved.clone())
+                            {
+                                guard_moves.insert(g as *const Expr as usize, mv);
+                            }
+                        }
+                        st.scope_pop();
                     }
                 }
                 ck.check_match(&st, subject, arms, *span);

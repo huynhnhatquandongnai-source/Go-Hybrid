@@ -2308,20 +2308,36 @@ impl<'a> Checker<'a> {
             }
             return;
         }
+        let cur_shape = self
+            .lookup_binding(st, name)
+            .map(|b| b.shape.clone())
+            .unwrap_or(TypeShape::Unknown);
         let mut rhs = pre_st.clone();
         rhs.aliases.remove(name);
         rhs.share_clear(name);
-        if let Some(binding) = rhs.env_lookup_mut(name) {
-            binding.non_owned_origin = None;
-        }
+        rhs.env_define(
+            name,
+            Binding {
+                shape: cur_shape.clone(),
+                ty: None,
+                immutable: false,
+                is_let: false,
+                managed_taint: false,
+                moved: None,
+                non_owned_origin: None,
+                slot_loan: false,
+            },
+        );
         if multi {
-            let shape = self.lookup_binding(st, name).map(|b| b.shape.clone()).unwrap_or(TypeShape::Unknown);
-            self.record_multi_value_share_and_alias(&mut rhs, name, &shape, value);
+            self.record_multi_value_share_and_alias(&mut rhs, name, &cur_shape, value);
         } else {
             self.record_may_share(&mut rhs, name, value);
             self.record_alias(&mut rhs, name, value);
         }
-        if let Some(origin) = self.lookup_binding(&rhs, name).and_then(|b| b.non_owned_origin.clone()) {
+        if let Some(origin) = self
+            .lookup_binding(&rhs, name)
+            .and_then(|b| b.non_owned_origin.clone())
+        {
             if let Some(binding) = st.env_lookup_mut(name) {
                 if binding.non_owned_origin.is_none() {
                     binding.non_owned_origin = Some(origin);
@@ -2333,6 +2349,8 @@ impl<'a> Checker<'a> {
         if let Some(source) = &alias {
             sources.insert(source.clone());
         }
+        let target_carries =
+            self.shape_may_share(&cur_shape) || matches!(cur_shape, TypeShape::Unknown);
         for source in sources {
             let mut peers = self.storage_peers(pre_st, &source);
             peers.insert(0, source.clone());
@@ -2340,7 +2358,68 @@ impl<'a> Checker<'a> {
                 if overwritten.contains(&peer) {
                     if local && pre_st.scopes.last().is_some_and(|top| !top.contains_key(&peer)) {
                         if let Some(depth) = pre_st.lookup_depth(&peer) {
-                            st.shadow_links.entry(name.to_string()).or_default().insert((peer.clone(), depth));
+                            st.shadow_links
+                                .entry(name.to_string())
+                                .or_default()
+                                .insert((peer.clone(), depth));
+                        }
+                    }
+                    if target_carries {
+                        let pre_origin = self
+                            .non_owned_origin_of(pre_st, &peer)
+                            .or_else(|| {
+                                self.binding_const_root(pre_st, &peer)
+                                    .map(|c| (format!("`const {}`", c), true))
+                            });
+                        if let Some((orig, via_share)) = pre_origin {
+                            let is_direct_alias = alias.as_ref() == Some(&peer)
+                                && (cur_shape.is_reference_alias()
+                                    || matches!(cur_shape, TypeShape::OwnHandle(_)));
+                            let chosen = if is_direct_alias && !via_share {
+                                orig
+                            } else if orig.starts_with("a may-share peer of ") {
+                                orig
+                            } else {
+                                format!("a may-share peer of {}", orig)
+                            };
+                            if let Some(nb) = st.env_lookup_mut(name) {
+                                if nb.non_owned_origin.is_none() {
+                                    nb.non_owned_origin = Some(chosen);
+                                }
+                            }
+                        }
+                        for loan in &pre_st.loans {
+                            match &loan.target {
+                                LoanTarget::Handle { handle }
+                                    if a3_paths_conflict(pre_st, handle, &peer) =>
+                                {
+                                    st.loans.push(Loan {
+                                        target: LoanTarget::Handle {
+                                            handle: name.to_string(),
+                                        },
+                                        created: loan.created,
+                                        last: loan.last,
+                                        span: loan.span,
+                                        desc: loan.desc.clone(),
+                                    });
+                                }
+                                LoanTarget::MapSlot { binding, path, key }
+                                    if a3_paths_conflict(pre_st, path, &peer) =>
+                                {
+                                    st.loans.push(Loan {
+                                        target: LoanTarget::MapSlot {
+                                            binding: binding.clone(),
+                                            path: name.to_string(),
+                                            key: key.clone(),
+                                        },
+                                        created: loan.created,
+                                        last: loan.last,
+                                        span: loan.span,
+                                        desc: loan.desc.clone(),
+                                    });
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 } else if peer != name {
@@ -2350,7 +2429,10 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(links) = pre_st.shadow_links.get(&peer) {
-                    st.shadow_links.entry(name.to_string()).or_default().extend(links.iter().cloned());
+                    st.shadow_links
+                        .entry(name.to_string())
+                        .or_default()
+                        .extend(links.iter().cloned());
                 }
             }
         }
@@ -8629,5 +8711,62 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn parallel_define_overwriting_earlier_lhs_preserves_const_and_non_owned_and_a3() {
+        let src_const = "\
+const SHARED = map[string]int{\"k\": 0}
+
+fn main() {
+    SHARED, alias := 1, SHARED
+    _ = SHARED
+    alias[\"k\"] = 99
 }
+";
+        assert!(
+            check_codes(src_const).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when parallel define shadows const on earlier LHS and aliases it on later LHS"
+        );
+
+        let src_param = "\
+fn worker(m map[string]int) {
+    _ = m
+}
+
+fn leak(m map[string]int) {
+    if true {
+        m, alias := 1, m
+        _ = m
+        task worker(move alias)
+    }
+}
+";
+        assert!(
+            check_codes(src_param).iter().any(|c| c == "HYB-E3004"),
+            "expected HYB-E3004 when parallel define shadows param on earlier LHS and moves later LHS alias"
+        );
+
+        let src_a3 = "\
+struct Entry {
+    n int
+}
+
+fn main() {
+    m := map[string]Entry{\"a\": Entry{n: 1}}
+    e := &m[\"a\"]
+    if true {
+        m, alias := 1, m
+        _ = m
+        alias[\"b\"] = Entry{n: 2}
+    }
+    e.n = 99
+}
+";
+        assert!(
+            check_codes(src_a3).iter().any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 when parallel define shadows loaned map on earlier LHS and mutates later LHS alias"
+        );
+    }
+}
+
 

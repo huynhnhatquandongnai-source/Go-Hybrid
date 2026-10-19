@@ -360,6 +360,16 @@ impl FnState {
             }
         };
 
+        let shadow_survives_in_parent =
+            |sname: &str, sdepth: usize, scopes: &[HashMap<String, Binding>]| -> bool {
+                sdepth < scopes.len()
+                    && !scopes
+                        .iter()
+                        .take(scopes.len().saturating_sub(1))
+                        .skip(sdepth)
+                        .any(|layer| layer.contains_key(sname))
+            };
+
         // Propagate non_owned_origin from popped-scope bindings (e.g. range vars,
         // match arm bindings, self-shadowed params) to any surviving outer binding
         // that joined their sharing group or alias chain inside the block.
@@ -391,6 +401,12 @@ impl FnState {
                                 peer_orig.clone()
                             },
                         ));
+                    } else if let Some(links) = self.shadow_links.get(&a) {
+                        for (sname, sdepth) in links {
+                            if shadow_survives_in_parent(sname, *sdepth, &self.scopes) {
+                                inner_outer_origins.push((sname.clone(), peer_orig.clone()));
+                            }
+                        }
                     }
                 }
             }
@@ -409,13 +425,27 @@ impl FnState {
         }
         for a in self.may_share.keys() {
             if let Some(mv) = self.env_lookup(a).and_then(|b| b.moved.clone()) {
+                if let Some(links) = self.shadow_links.get(a) {
+                    for (sname, sdepth) in links {
+                        if shadow_survives_in_parent(sname, *sdepth, &self.scopes) {
+                            inner_root_moves.push((sname.clone(), mv.clone()));
+                        }
+                    }
+                }
                 for peer in self.share_group(a) {
                     let root = crate::freeze::resolve_alias(self, &peer);
                     if survives_as_outer(&peer, &self.aliases, &self.env, &self.scopes) {
-                        inner_root_moves.push((peer, mv.clone()));
+                        inner_root_moves.push((peer.clone(), mv.clone()));
                     }
                     if survives_as_outer(&root, &self.aliases, &self.env, &self.scopes) {
                         inner_root_moves.push((root, mv.clone()));
+                    }
+                    if let Some(links) = self.shadow_links.get(&peer) {
+                        for (sname, sdepth) in links {
+                            if shadow_survives_in_parent(sname, *sdepth, &self.scopes) {
+                                inner_root_moves.push((sname.clone(), mv.clone()));
+                            }
+                        }
                     }
                 }
             }
@@ -423,6 +453,7 @@ impl FnState {
         // Preserve may-share relationships established inside the block between
         // outer bindings (including through self-shadowed outer bindings).
         let mut inner_outer_shares: Vec<(String, String)> = Vec::new();
+        let mut inner_outer_shadow_links: Vec<(String, (String, usize))> = Vec::new();
         for a in self.may_share.keys() {
             let Some(oa) = to_outer_name(a, &self.aliases, &self.env, &self.scopes) else {
                 continue;
@@ -431,10 +462,23 @@ impl FnState {
                 if let Some(ob) = to_outer_name(&b, &self.aliases, &self.env, &self.scopes) {
                     inner_outer_shares.push((oa.clone(), ob));
                 }
+                if let Some(links) = self.shadow_links.get(&b) {
+                    for (sname, sdepth) in links {
+                        if shadow_survives_in_parent(sname, *sdepth, &self.scopes) {
+                            inner_outer_shares.push((oa.clone(), sname.clone()));
+                        } else if *sdepth < self.scopes.len().saturating_sub(1) {
+                            inner_outer_shadow_links
+                                .push((oa.clone(), (sname.clone(), *sdepth)));
+                        }
+                    }
+                }
             }
         }
         self.scopes.pop();
-        if let Some(outer_shadows) = self.shadow_link_scopes.pop() {
+        if let Some(mut outer_shadows) = self.shadow_link_scopes.pop() {
+            for (oa, link) in inner_outer_shadow_links {
+                outer_shadows.entry(oa).or_default().insert(link);
+            }
             self.shadow_links = outer_shadows;
         }
         if let Some(outer_aliases) = self.alias_scopes.pop() {

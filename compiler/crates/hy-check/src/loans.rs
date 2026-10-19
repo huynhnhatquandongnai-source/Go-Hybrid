@@ -5234,6 +5234,184 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Bind the iteration variables `vars` of `for vars in expr` in the loop's
+    /// scope. Evaluates all storage-sharing, reference-alias, shadow,
+    /// `const`-immutability, and `non_owned_origin` metadata against the
+    /// pre-loop state BEFORE defining any loop variable in `vars`, so neither
+    /// self-shadowing (`for xs in xs`) nor multi-variable shadowing of the
+    /// collection by an earlier loop variable (`for a, b in a`) can sever
+    /// `may_share` peers, outer shadow links, or `const` roots.
+    pub(crate) fn bind_iterate_vars(
+        &mut self,
+        st: &mut FnState,
+        vars: &[String],
+        expr: &Expr,
+        managed: bool,
+    ) {
+        let is_chan = matches!(self.shape_of_expr(st, expr), TypeShape::Chan(_));
+        let shapes = self.iterate_var_shapes(st, expr, vars.len());
+
+        let mut roots = Vec::new();
+        let mut borrowed_roots = Vec::new();
+        if !is_chan {
+            collect_ref_roots(expr, &mut roots);
+            self.collect_callee_const_return_roots(st, expr, &mut roots, 0);
+            self.collect_borrowed_roots(st, expr, &mut borrowed_roots);
+        }
+
+        let pre_tainted = !is_chan
+            && roots.iter().any(|r| {
+                self.lookup_binding(st, r)
+                    .map(|b| b.managed_taint)
+                    .unwrap_or(false)
+            });
+        let pre_moved = if !is_chan {
+            roots
+                .iter()
+                .find_map(|r| self.lookup_binding(st, r).and_then(|b| b.moved.clone()))
+        } else {
+            None
+        };
+        let pre_const_root = if !is_chan {
+            roots.iter().find_map(|r| {
+                let p = Place {
+                    kind: PlaceKind::Ident(r.clone()),
+                    span: expr.span(),
+                };
+                self.const_write_root(st, &p)
+            })
+        } else {
+            None
+        };
+
+        let mut pre_share_peers: Vec<String> = Vec::new();
+        let mut pre_shadow_links: HashSet<(String, usize)> = HashSet::new();
+        let mut pre_alias_root: Option<String> = None;
+        if !is_chan {
+            for r in roots.iter().chain(borrowed_roots.iter()) {
+                if self.binding_may_share(st, r)
+                    || self.expr_slices_addressable_array(st, expr, r)
+                    || !st.share_group(r).is_empty()
+                {
+                    let mut group: Vec<String> = st.share_group(r).into_iter().collect();
+                    group.insert(0, r.clone());
+                    for member in group {
+                        if let Some(depth) = st.lookup_depth(&member) {
+                            pre_shadow_links.insert((member.clone(), depth));
+                        }
+                        if let Some(links) = st.shadow_links.get(&member) {
+                            pre_shadow_links.extend(links.iter().cloned());
+                        }
+                        if !pre_share_peers.contains(&member) {
+                            pre_share_peers.push(member);
+                        }
+                    }
+                }
+                if pre_alias_root.is_none()
+                    && self
+                        .lookup_binding(st, r)
+                        .map(|b| self.shape_may_share(&b.shape))
+                        .unwrap_or(false)
+                {
+                    pre_alias_root = Some(crate::freeze::resolve_alias(st, r));
+                }
+            }
+        }
+
+        let pre_st = st.clone();
+        let mut overwritten: Vec<String> = Vec::new();
+        for (name, shape) in vars.iter().zip(shapes) {
+            let is_ref = shape.is_reference_alias() || shape.is_handle();
+            let may_share = self.shape_may_share(&shape);
+            let self_shadows_const =
+                !is_chan && may_share && pre_const_root.as_deref() == Some(name.as_str());
+            if name != "_" {
+                overwritten.push(name.clone());
+            }
+            self.define_binding(
+                st,
+                name,
+                shape,
+                None,
+                self_shadows_const,
+                managed || (!is_chan && may_share && pre_tainted),
+                false,
+            );
+            if !is_chan && name != "_" {
+                if may_share {
+                    self.record_storage_from_snapshot(
+                        st,
+                        &pre_st,
+                        name,
+                        expr,
+                        &overwritten,
+                        true,
+                        false,
+                    );
+                    for peer in &pre_share_peers {
+                        if peer != name && !vars.contains(peer) {
+                            st.share_edge(name, peer);
+                        }
+                    }
+                    if !pre_shadow_links.is_empty() {
+                        st.shadow_links
+                            .entry(name.clone())
+                            .or_default()
+                            .extend(pre_shadow_links.iter().cloned());
+                    }
+                    if let Some(aroot) = &pre_alias_root {
+                        if !vars.contains(aroot) || aroot == name {
+                            st.aliases
+                                .entry(name.clone())
+                                .or_insert_with(|| aroot.clone());
+                        }
+                    } else if pre_share_peers.iter().any(|p| p == name) {
+                        st.aliases
+                            .entry(name.clone())
+                            .or_insert_with(|| name.clone());
+                    }
+                    if let Some(croot) = &pre_const_root {
+                        if croot != name && !vars.contains(croot) {
+                            st.share_edge(name, croot);
+                            st.aliases
+                                .entry(name.clone())
+                                .or_insert_with(|| croot.clone());
+                        }
+                    }
+                }
+                if is_ref {
+                    if let Some(root) = expr.root_ident() {
+                        if !vars.contains(&root.to_string()) || root == name {
+                            if self.lookup_binding(&pre_st, root).is_some() {
+                                st.aliases
+                                    .entry(name.clone())
+                                    .or_insert_with(|| root.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(b) = st.env_lookup_mut(name) {
+                    if may_share && b.moved.is_none() {
+                        b.moved = pre_moved.clone();
+                    }
+                    b.non_owned_origin = Some(match (&pre_const_root, may_share) {
+                        (Some(croot), true) => format!(
+                            "range variable `{}` iterating `{}` (`const {}` — the collection still holds the element)",
+                            name,
+                            expr.render(),
+                            croot
+                        ),
+                        _ => format!(
+                            "range variable `{}` iterating `{}` (the collection still holds the element)",
+                            name,
+                            expr.render()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Assignments (A3 inserts, A6 field stores, whole-binding rebinds)
     // -----------------------------------------------------------------------
@@ -6173,29 +6351,7 @@ impl<'a> Checker<'a> {
                 }
                 Stmt::For { kind, .. } => match kind {
                     hy_syntax::ForKind::Iterate { vars, expr } => {
-                        let is_chan =
-                            matches!(self.shape_of_expr(&cst, expr), TypeShape::Chan(_));
-                        let shapes = self.iterate_var_shapes(&cst, expr, vars.len());
-                        for (name, shape) in vars.iter().zip(shapes) {
-                            let is_ref = shape.is_reference_alias() || shape.is_handle();
-                            let carries = self.shape_may_share(&shape);
-                            self.define_binding(&mut cst, name, shape, None, false, false, false);
-                            if !is_chan {
-                                let mut roots = Vec::new();
-                                collect_ref_roots(expr, &mut roots);
-                                self.collect_callee_const_return_roots(&cst, expr, &mut roots, 0);
-                                for root in roots {
-                                    if self.lookup_binding(&cst, &root).is_some() {
-                                        if is_ref {
-                                            cst.aliases.insert(name.clone(), root.clone());
-                                        }
-                                        if carries && self.binding_may_share(&cst, &root) {
-                                            cst.share_edge(name, &root);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        self.bind_iterate_vars(&mut cst, vars, expr, false);
                     }
                     hy_syntax::ForKind::Range { var, .. } => {
                         self.define_binding(&mut cst, var, TypeShape::Primitive, None, false, false, false);

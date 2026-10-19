@@ -1204,12 +1204,16 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
 
 /// Check A3 (`HYB-E3102`) for map-slot loans opened inside a closure body.
 fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block) {
-    use crate::model::{Loan, LoanTarget};
+    use crate::model::{Loan, LoanTarget, TypeShape};
     use crate::walk;
     let flat = walk::flatten(body);
     let saved_last_use = std::mem::replace(&mut st.last_use, flat.last_use.clone());
     let saved_loop_end = std::mem::replace(&mut st.loop_end, flat.loop_end.clone());
     let saved_loans = std::mem::take(&mut st.loans);
+    let saved_env = st.env.clone();
+    let saved_scopes = st.scopes.clone();
+    let saved_aliases = st.aliases.clone();
+    let saved_share = st.may_share.clone();
     for (stmt, idx) in &flat.stmts {
         let idx = *idx;
         let mut calls = Vec::new();
@@ -1222,6 +1226,22 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
             Stmt::Local(l) => {
                 if l.names.len() == l.values.len() {
                     for (name, val) in l.names.iter().zip(l.values.iter()) {
+                        let inferred = ck.shape_of_expr(st, val);
+                        let (shape, ty) = match (&l.ty, inferred) {
+                            (Some(t), TypeShape::Unknown) => {
+                                (ck.shape_of_type(t), Some(t.clone()))
+                            }
+                            (_, inferred) => (
+                                inferred,
+                                ck.ty_of_expr(st, val).or_else(|| l.ty.clone()),
+                            ),
+                        };
+                        if !matches!(shape, TypeShape::Handle(_)) {
+                            ck.define_binding(st, name, shape, ty, false, false, false);
+                        }
+                        ck.record_may_share(st, name, val);
+                        ck.record_alias(st, name, val);
+                        ck.record_move_const_and_a3_loans(st, name, val, idx);
                         if let Some(path) = walk::addr_of_index_base_path(val) {
                             let binding = name.clone();
                             let key = walk::addr_of_index_slot_key(val);
@@ -1249,9 +1269,25 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                 values,
                 ..
             } => {
+                for t in targets {
+                    match &t.kind {
+                        hy_syntax::PlaceKind::Index { .. } => {
+                            if let Some(path) = walk::place_path(t) {
+                                ck.emit_a3_if_live_pub(st, &path, t.span, idx, "insert");
+                            }
+                        }
+                        hy_syntax::PlaceKind::Ident(name) => {
+                            ck.emit_a3_if_live_pub(st, name, t.span, idx, "rebind");
+                        }
+                        _ => {}
+                    }
+                }
                 if *op == hy_syntax::AssignOp::Assign && targets.len() == values.len() {
                     for (t, v) in targets.iter().zip(values.iter()) {
                         if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                            ck.record_may_share(st, name, v);
+                            ck.record_alias(st, name, v);
+                            ck.record_move_const_and_a3_loans(st, name, v, idx);
                             if let Some(path) = walk::addr_of_index_base_path(v) {
                                 let binding = name.clone();
                                 let key = walk::addr_of_index_slot_key(v);
@@ -1274,17 +1310,14 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                         }
                     }
                 }
-                for t in targets {
-                    if matches!(t.kind, hy_syntax::PlaceKind::Index { .. }) {
-                        if let Some(path) = walk::place_path(t) {
-                            ck.emit_a3_if_live_pub(st, &path, t.span, idx, "insert");
-                        }
-                    }
-                }
             }
             _ => {}
         }
     }
+    st.may_share = saved_share;
+    st.aliases = saved_aliases;
+    st.scopes = saved_scopes;
+    st.env = saved_env;
     st.loans = saved_loans;
     st.loop_end = saved_loop_end;
     st.last_use = saved_last_use;
@@ -2098,4 +2131,45 @@ fn main() {
 "#;
         assert_eq!(codes(src), vec!["HYB-E3003"]);
     }
+
+    #[test]
+    fn reject_closure_map_slot_loan_whole_map_rebind_and_local_alias_issue_822() {
+        let rebind_src = r#"import "fmt"
+
+type Box struct {
+    n int
 }
+
+fn main() {
+    m := map[string]Box{"a": Box{n: 1}}
+    f := fn() {
+        p := &m["a"]
+        m = map[string]Box{}
+        fmt.println(p.n)
+    }
+    f()
+}
+"#;
+        assert_eq!(codes(rebind_src), vec!["HYB-E3102"]);
+
+        let alias_src = r#"import "fmt"
+
+type Box struct {
+    n int
+}
+
+fn main() {
+    f := fn() {
+        m := map[string]Box{"a": Box{n: 1}}
+        m2 := m
+        p := &m["a"]
+        m2["b"] = Box{n: 2}
+        fmt.println(p.n)
+    }
+    f()
+}
+"#;
+        assert_eq!(codes(alias_src), vec!["HYB-E3102"]);
+    }
+}
+

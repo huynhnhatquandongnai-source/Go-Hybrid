@@ -5606,11 +5606,35 @@ impl<'a> Checker<'a> {
                 } else {
                     let root = t.root();
                     if !root.is_empty() && self.binding_may_share(st, root) {
+                        if !info.is_fresh_copy {
+                            self.record_storage_from_snapshot(
+                                st,
+                                &pre_st,
+                                root,
+                                v,
+                                &overwritten,
+                                false,
+                                false,
+                            );
+                        }
                         self.record_may_share(st, root, v);
+                        self.record_move_const_and_a3_loans(st, root, v, idx);
+                        if let Some(origin) = info
+                            .non_owned
+                            .or_else(|| self.moved_non_owned_origin_in_expr(st, v))
+                        {
+                            if let Some(b) = st.env_lookup_mut(root) {
+                                if b.non_owned_origin.is_none() || origin.contains("`const ") {
+                                    b.non_owned_origin = Some(origin);
+                                }
+                            }
+                        }
                     }
                 }
             }
         } else if values.len() == 1 && targets.len() > 1 {
+            let pre_st = st.clone();
+            let mut overwritten = Vec::new();
             let moved_non_owned = self.moved_non_owned_origin_in_expr(st, &values[0]);
             let shapes = self.multi_value_shapes(st, &values[0], targets.len());
             let tys = self.multi_value_tys(st, &values[0], targets.len());
@@ -5622,6 +5646,7 @@ impl<'a> Checker<'a> {
                     continue;
                 }
                 if let PlaceKind::Ident(name) = &t.kind {
+                    overwritten.push(name.clone());
                     let may_share = self.shape_may_share(&shape);
                     let reads_self = may_share
                         && (self.value_reads_storage_of(st, &values[0], name)
@@ -5709,6 +5734,15 @@ impl<'a> Checker<'a> {
                             st.share_edge(name, &peer);
                         }
                     }
+                    self.record_storage_from_snapshot(
+                        st,
+                        &pre_st,
+                        name,
+                        &values[0],
+                        &overwritten,
+                        false,
+                        true,
+                    );
                     self.record_multi_value_share_and_alias(st, name, &shape, &values[0]);
                     if may_share {
                         for r in &ref_roots {
@@ -5743,7 +5777,24 @@ impl<'a> Checker<'a> {
                 } else {
                     let root = t.root();
                     if !root.is_empty() && self.binding_may_share(st, root) {
+                        self.record_storage_from_snapshot(
+                            st,
+                            &pre_st,
+                            root,
+                            &values[0],
+                            &overwritten,
+                            false,
+                            true,
+                        );
                         self.record_multi_value_may_share(st, root, &shape, &values[0]);
+                        self.record_move_const_and_a3_loans(st, root, &values[0], idx);
+                        if let Some(origin) = &moved_non_owned {
+                            if let Some(b) = st.env_lookup_mut(root) {
+                                if b.non_owned_origin.is_none() || origin.contains("`const ") {
+                                    b.non_owned_origin = Some(origin.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -6118,6 +6169,7 @@ impl<'a> Checker<'a> {
                                 let root = t.root();
                                 if !root.is_empty() && self.binding_may_share(&cst, root) {
                                     self.record_may_share(&mut cst, root, v);
+                                    self.record_move_const_and_a3_loans(&mut cst, root, v, 0);
                                 }
                             }
                         }
@@ -6148,6 +6200,12 @@ impl<'a> Checker<'a> {
                                     &shape,
                                     &values[0],
                                 );
+                                self.record_move_const_and_a3_loans(
+                                    &mut cst,
+                                    name,
+                                    &values[0],
+                                    0,
+                                );
                             } else {
                                 let root = t.root();
                                 if !root.is_empty() && self.binding_may_share(&cst, root) {
@@ -6156,6 +6214,12 @@ impl<'a> Checker<'a> {
                                         root,
                                         &shape,
                                         &values[0],
+                                    );
+                                    self.record_move_const_and_a3_loans(
+                                        &mut cst,
+                                        root,
+                                        &values[0],
+                                        0,
                                     );
                                 }
                             }
@@ -8629,5 +8693,32 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn field_and_index_assign_propagates_move_slot_loans_and_const_issue_843() {
+        let src_a3 = "\
+struct Entry {
+    n int
 }
+
+struct Holder {
+    m map[string]Entry
+}
+
+fn main() {
+    m := map[string]Entry{\"a\": Entry{n: 1}}
+    var h Holder
+    e := &m[\"a\"]
+    h.m = move m
+    h.m[\"b\"] = Entry{n: 2}
+    e.n = 99
+}
+";
+        assert!(
+            check_codes(src_a3).iter().any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 when moving map with live slot loan into struct field and mutating it"
+        );
+    }
+}
+
 

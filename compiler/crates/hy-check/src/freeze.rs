@@ -148,9 +148,12 @@ impl<'a> Checker<'a> {
                 if let Some((mv_name, _, mv_info)) = stmt_moves.iter().find(|(mv_name, r, mv)| {
                     same_or_shared(st, &u.name, &root, mv_name, r) && mv.span != u.span
                 }) {
+                    let shares_storage = st.may_share.get(mv_name).is_some_and(|p| !p.is_empty())
+                        || st.aliases.contains_key(mv_name)
+                        || st.aliases.values().any(|parent| parent == mv_name);
                     if self
                         .lookup_binding(st, mv_name)
-                        .map(|b| !b.shape.is_sendable_by_type())
+                        .map(|b| !b.shape.is_sendable_by_type() || shares_storage)
                         .unwrap_or(false)
                         && reported.insert(format!("{}@{}", u.name, u.span.start.line))
                     {

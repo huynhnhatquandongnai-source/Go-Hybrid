@@ -2449,10 +2449,30 @@ impl<'a> Checker<'a> {
                         // views the array's storage even when the element
                         // type is primitive - link it so a later move
                         // freezes the array too.
-                        if self.shape_may_share(&b.shape)
-                            || self.expr_slices_addressable_array(st, value, &root)
-                        {
+                        let slices_arr = self.expr_slices_addressable_array(st, value, &root);
+                        if self.shape_may_share(&b.shape) || slices_arr {
                             st.share_edge(name, &root);
+                        }
+                        if slices_arr {
+                            let origin = b.non_owned_origin.clone().or_else(|| {
+                                if b.immutable {
+                                    Some(format!("`const {}`", root))
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(origin) = origin {
+                                let peer_origin = if origin.starts_with("a may-share peer of ") {
+                                    origin
+                                } else {
+                                    format!("a may-share peer of {}", origin)
+                                };
+                                if let Some(nb) = st.env_lookup_mut(name) {
+                                    if nb.non_owned_origin.is_none() {
+                                        nb.non_owned_origin = Some(peer_origin);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3664,6 +3684,7 @@ impl<'a> Checker<'a> {
                                 self.shape_carries_handle(&b.shape)
                             } else {
                                 b.shape.is_reference_alias()
+                                    || self.expr_slices_addressable_array(st, value, &src)
                                     || (borrowed_roots.iter().any(|r| r == &src)
                                         && self.binding_can_be_borrowed(st, &src))
                             };
@@ -8629,5 +8650,36 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn slice_of_addressable_value_array_propagates_non_owned_and_same_stmt_freeze() {
+        let src_non_owned_shadow = "\
+fn run(arr [2]int, ch chan []int) {
+    s := arr[:]
+    arr := [2]int{0, 0}
+    _ = arr
+    ch <- move s
 }
+";
+        assert!(
+            check_codes(src_non_owned_shadow).iter().any(|c| c == "HYB-E3004"),
+            "expected HYB-E3004 when moving slice of non-owned [2]int array even if arr is shadowed"
+        );
+
+        let src_same_stmt = "\
+fn main() {
+    arr := [2]int{1, 2}
+    s := arr[:]
+    x, a := s[0], move arr
+    _ = x
+    _ = a
+}
+";
+        assert!(
+            check_codes(src_same_stmt).iter().any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when reading slice peer s in same statement as move arr"
+        );
+    }
+}
+
 

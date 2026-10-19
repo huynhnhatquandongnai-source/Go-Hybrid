@@ -516,7 +516,7 @@ impl<'a> Checker<'a> {
     /// overwritten by, or overwrites, the loan's store-back. `owner` is the
     /// binding being (re)loaned, whose own earlier loan does not conflict.
     #[allow(clippy::too_many_arguments)]
-    fn emit_o8_alias_if_live(
+    pub(crate) fn emit_o8_alias_if_live(
         &mut self,
         st: &FnState,
         path: &str,
@@ -8627,6 +8627,64 @@ fn main() {
         assert!(
             check_codes(src_a6).iter().any(|c| c == "HYB-E3103"),
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
+        );
+    }
+
+    #[test]
+    fn closure_slot_loan_o8_uniqueness_and_t24_rebind_issue_889() {
+        let src_dup_loan = "\
+struct svc { count int }
+fn main() {
+    m := map[string]svc{\"a\": svc{count: 1}}
+    f := fn() {
+        s1 := &m[\"a\"]
+        s2 := &m[\"a\"]
+        s1.count += 10
+        s2.count += 20
+    }
+    f()
+}
+";
+        assert!(
+            check_codes(src_dup_loan).iter().any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 for duplicate map-slot loan inside closure"
+        );
+
+        let src_field_store = "\
+struct svc { count int }
+fn main() {
+    m := map[string]svc{\"a\": svc{count: 1}}
+    f := fn() {
+        s := &m[\"a\"]
+        m[\"a\"].count = 99
+        s.count += 1
+    }
+    f()
+}
+";
+        assert!(
+            check_codes(src_field_store)
+                .iter()
+                .any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 for direct map-slot field store during live slot loan inside closure"
+        );
+
+        let src_rebind = "\
+struct svc { count int }
+fn main() {
+    m := map[string]svc{\"a\": svc{count: 1}}
+    var v svc
+    f := fn() {
+        s := &m[\"a\"]
+        s = &v
+        s.count = 99
+    }
+    f()
+}
+";
+        assert!(
+            check_codes(src_rebind).iter().any(|c| c == "HYB-E3104"),
+            "expected HYB-E3104 for re-binding a map-slot loan to a general pointer inside closure"
         );
     }
 }

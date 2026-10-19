@@ -4325,7 +4325,11 @@ impl<'a> Checker<'a> {
                         aliases.insert(cname.clone(), HashSet::from([cname.clone()]));
                     }
                 }
-                for (local_name, lb) in &st.env {
+                for (local_name, lb) in st
+                    .env
+                    .iter()
+                    .chain(st.scopes.iter().flat_map(|s| s.iter()))
+                {
                     if !shadowed.contains(local_name) {
                         if let Some(croot) = self.const_write_root(
                             st,
@@ -4363,41 +4367,230 @@ impl<'a> Checker<'a> {
                         set
                     };
                 let flat = walk::flatten(body);
-                for (stmt, _) in &flat.stmts {
+                let mut scope_stack: Vec<(
+                    HashMap<String, HashSet<String>>,
+                    HashSet<String>,
+                    HashSet<String>,
+                )> = Vec::new();
+                let define_const_alias =
+                    |n: &str,
+                     cs: HashSet<String>,
+                     aliases: &mut HashMap<String, HashSet<String>>,
+                     shadowed: &mut HashSet<String>,
+                     scope_stack: &mut Vec<(
+                         HashMap<String, HashSet<String>>,
+                         HashSet<String>,
+                         HashSet<String>,
+                     )>| {
+                        if n == "_" || n.is_empty() {
+                            return;
+                        }
+                        if let Some((_, _, defs)) = scope_stack.last_mut() {
+                            defs.insert(n.to_string());
+                        }
+                        if cs.is_empty() {
+                            aliases.remove(n);
+                            shadowed.insert(n.to_string());
+                        } else {
+                            shadowed.remove(n);
+                            aliases.insert(n.to_string(), cs);
+                        }
+                    };
+                for (stmt, idx) in flat.stmts.iter().copied() {
+                    if let Some(events) = flat.scope_events.get(&idx) {
+                        for ev in events {
+                            match ev {
+                                walk::ScopeEvent::Push => {
+                                    scope_stack.push((
+                                        aliases.clone(),
+                                        shadowed.clone(),
+                                        HashSet::new(),
+                                    ));
+                                }
+                                walk::ScopeEvent::Pop => {
+                                    if let Some((saved_a, saved_s, defs)) = scope_stack.pop() {
+                                        for d in defs {
+                                            if let Some(prev) = saved_a.get(&d) {
+                                                aliases.insert(d.clone(), prev.clone());
+                                            } else {
+                                                aliases.remove(&d);
+                                            }
+                                            if saved_s.contains(&d) {
+                                                shadowed.insert(d);
+                                            } else {
+                                                shadowed.remove(&d);
+                                            }
+                                        }
+                                    }
+                                }
+                                walk::ScopeEvent::MatchBind { name, subject } => {
+                                    let cs = expr_const_origins(subject, &aliases, &shadowed);
+                                    define_const_alias(
+                                        name,
+                                        cs,
+                                        &mut aliases,
+                                        &mut shadowed,
+                                        &mut scope_stack,
+                                    );
+                                }
+                                walk::ScopeEvent::SelectRecv { names, chan } => {
+                                    let cs = expr_const_origins(chan, &aliases, &shadowed);
+                                    for n in names {
+                                        define_const_alias(
+                                            n,
+                                            cs.clone(),
+                                            &mut aliases,
+                                            &mut shadowed,
+                                            &mut scope_stack,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut calls = Vec::new();
+                    walk::own_calls(stmt, &mut calls);
+                    for cr in &calls {
+                        if let Expr::Ident { name, .. } = unwrap_parens(cr.callee) {
+                            if name == "copy" && cr.args.len() >= 2 {
+                                let src_cs =
+                                    expr_const_origins(&cr.args[1].value, &aliases, &shadowed);
+                                if !src_cs.is_empty() {
+                                    let mut dst_roots = Vec::new();
+                                    collect_ref_roots(&cr.args[0].value, &mut dst_roots);
+                                    for dr in dst_roots {
+                                        aliases
+                                            .entry(dr)
+                                            .or_default()
+                                            .extend(src_cs.iter().cloned());
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((slots, cbody)) = self.resolve_callee_slots_and_body(st, cr) {
+                            if slots.len() >= 2 {
+                                let slots_meta: Vec<(&str, TypeShape, Option<&hy_syntax::TypeExpr>)> =
+                                    slots
+                                        .iter()
+                                        .map(|(n, sh, ty, _)| (n.as_str(), sh.clone(), ty.as_ref()))
+                                        .collect();
+                                for (dst_idx, src_idx) in
+                                    self.collect_callee_param_stores(&slots_meta, &cbody, depth + 1)
+                                {
+                                    if let (Some((_, _, _, dst_src)), Some((_, _, _, src_src))) =
+                                        (slots.get(dst_idx), slots.get(src_idx))
+                                    {
+                                        let src_cs = match src_src {
+                                            CalleeSlotSource::Arg(src_e) => {
+                                                expr_const_origins(src_e, &aliases, &shadowed)
+                                            }
+                                            CalleeSlotSource::OuterBinding(bname) => {
+                                                aliases.get(bname).cloned().unwrap_or_default()
+                                            }
+                                        };
+                                        if !src_cs.is_empty() {
+                                            let mut dst_roots = Vec::new();
+                                            match dst_src {
+                                                CalleeSlotSource::Arg(dst_e) => {
+                                                    collect_ref_roots(dst_e, &mut dst_roots);
+                                                    collect_addr_of_roots(dst_e, &mut dst_roots);
+                                                }
+                                                CalleeSlotSource::OuterBinding(bname) => {
+                                                    dst_roots.push(bname.clone());
+                                                }
+                                            }
+                                            for dr in dst_roots {
+                                                aliases
+                                                    .entry(dr)
+                                                    .or_default()
+                                                    .extend(src_cs.iter().cloned());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     match stmt {
+                        Stmt::For {
+                            kind: ForKind::Iterate { vars, expr },
+                            ..
+                        } => {
+                            let cs = expr_const_origins(expr, &aliases, &shadowed);
+                            for v in vars {
+                                define_const_alias(
+                                    v,
+                                    cs.clone(),
+                                    &mut aliases,
+                                    &mut shadowed,
+                                    &mut scope_stack,
+                                );
+                            }
+                        }
+                        Stmt::For {
+                            kind: ForKind::Range { var, .. },
+                            ..
+                        } => {
+                            define_const_alias(
+                                var,
+                                HashSet::new(),
+                                &mut aliases,
+                                &mut shadowed,
+                                &mut scope_stack,
+                            );
+                        }
                         Stmt::Local(l) => {
                             if l.values.is_empty() {
                                 for n in &l.names {
-                                    aliases.remove(n);
-                                    shadowed.insert(n.clone());
+                                    define_const_alias(
+                                        n,
+                                        HashSet::new(),
+                                        &mut aliases,
+                                        &mut shadowed,
+                                        &mut scope_stack,
+                                    );
                                 }
                             } else if l.values.len() == 1 && l.names.len() > 1 {
                                 let cs = expr_const_origins(&l.values[0], &aliases, &shadowed);
                                 for n in &l.names {
-                                    if cs.is_empty() {
-                                        aliases.remove(n);
-                                        shadowed.insert(n.clone());
-                                    } else {
-                                        shadowed.remove(n);
-                                        aliases.insert(n.clone(), cs.clone());
-                                    }
+                                    define_const_alias(
+                                        n,
+                                        cs.clone(),
+                                        &mut aliases,
+                                        &mut shadowed,
+                                        &mut scope_stack,
+                                    );
                                 }
                             } else {
-                                for (n, v) in l.names.iter().zip(l.values.iter()) {
-                                    let cs = expr_const_origins(v, &aliases, &shadowed);
-                                    if cs.is_empty() {
-                                        aliases.remove(n);
-                                        shadowed.insert(n.clone());
-                                    } else {
-                                        shadowed.remove(n);
-                                        aliases.insert(n.clone(), cs);
-                                    }
+                                let rhs_cs: Vec<HashSet<String>> = l
+                                    .values
+                                    .iter()
+                                    .map(|v| expr_const_origins(v, &aliases, &shadowed))
+                                    .collect();
+                                for (n, cs) in l.names.iter().zip(rhs_cs) {
+                                    define_const_alias(
+                                        n,
+                                        cs,
+                                        &mut aliases,
+                                        &mut shadowed,
+                                        &mut scope_stack,
+                                    );
                                 }
                             }
                         }
                         Stmt::Assign {
                             targets, values, ..
                         } => {
+                            let in_branch = !scope_stack.is_empty();
+                            let is_defined_in_inner =
+                                |name: &str,
+                                 stack: &[(
+                                     HashMap<String, HashSet<String>>,
+                                     HashSet<String>,
+                                     HashSet<String>,
+                                 )]| {
+                                    stack.iter().any(|(_, _, defs)| defs.contains(name))
+                                };
                             if targets.len() == values.len() {
                                 let rhs_cs: Vec<HashSet<String>> = values
                                     .iter()
@@ -4406,7 +4599,12 @@ impl<'a> Checker<'a> {
                                 for (t, cs) in targets.iter().zip(rhs_cs) {
                                     match &t.kind {
                                         PlaceKind::Ident(n) => {
-                                            if cs.is_empty() {
+                                            if in_branch && !is_defined_in_inner(n, &scope_stack) {
+                                                if !cs.is_empty() {
+                                                    shadowed.remove(n);
+                                                    aliases.entry(n.clone()).or_default().extend(cs);
+                                                }
+                                            } else if cs.is_empty() {
                                                 aliases.remove(n);
                                                 shadowed.insert(n.clone());
                                             } else {
@@ -4430,7 +4628,15 @@ impl<'a> Checker<'a> {
                                 let cs = expr_const_origins(&values[0], &aliases, &shadowed);
                                 for t in targets {
                                     if let PlaceKind::Ident(n) = &t.kind {
-                                        if cs.is_empty() {
+                                        if in_branch && !is_defined_in_inner(n, &scope_stack) {
+                                            if !cs.is_empty() {
+                                                shadowed.remove(n);
+                                                aliases
+                                                    .entry(n.clone())
+                                                    .or_default()
+                                                    .extend(cs.clone());
+                                            }
+                                        } else if cs.is_empty() {
                                             aliases.remove(n);
                                             shadowed.insert(n.clone());
                                         } else {
@@ -4597,7 +4803,116 @@ impl<'a> Checker<'a> {
 
         let flat = walk::flatten(body);
         let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut scope_stack: Vec<(
+            HashMap<String, HashSet<String>>,
+            HashSet<String>,
+            HashSet<String>,
+        )> = Vec::new();
         for (stmt, idx) in flat.stmts.iter().copied() {
+            if let Some(events) = flat.scope_events.get(&idx) {
+                for ev in events {
+                    match ev {
+                        walk::ScopeEvent::Push => {
+                            cst.scope_push();
+                            scope_stack.push((origins.clone(), shadowed.clone(), HashSet::new()));
+                        }
+                        walk::ScopeEvent::Pop => {
+                            cst.scope_pop();
+                            if let Some((saved_o, saved_s, defs)) = scope_stack.pop() {
+                                for d in defs {
+                                    if let Some(prev) = saved_o.get(&d) {
+                                        origins.insert(d.clone(), prev.clone());
+                                    } else {
+                                        origins.remove(&d);
+                                    }
+                                    if saved_s.contains(&d) {
+                                        shadowed.insert(d);
+                                    } else {
+                                        shadowed.remove(&d);
+                                    }
+                                }
+                            }
+                        }
+                        walk::ScopeEvent::MatchBind { name, subject } => {
+                            if name != "_" && !name.is_empty() {
+                                let shape = self.shape_of_expr(&cst, subject);
+                                let ty = self.ty_of_expr(&cst, subject);
+                                let mut s = HashSet::new();
+                                self.collect_sharing_origins_expr(
+                                    &cst, subject, &origins, &shadowed, &mut s,
+                                );
+                                self.define_binding(
+                                    &mut cst,
+                                    name,
+                                    shape.clone(),
+                                    ty,
+                                    false,
+                                    false,
+                                    false,
+                                );
+                                if let Some((_, _, defs)) = scope_stack.last_mut() {
+                                    defs.insert(name.clone());
+                                }
+                                if self.shape_may_share(&shape)
+                                    || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
+                                    || !s.is_empty()
+                                {
+                                    if s.is_empty() {
+                                        s.insert(format!("match:{idx}:{name}"));
+                                    }
+                                    origins.insert(name.clone(), s);
+                                    shadowed.remove(name);
+                                } else {
+                                    origins.remove(name);
+                                    shadowed.insert(name.clone());
+                                }
+                            }
+                        }
+                        walk::ScopeEvent::SelectRecv { names, chan } => {
+                            let elem_ty = self.ty_of_expr(&cst, chan).and_then(|t| match t {
+                                hy_syntax::TypeExpr::Chan { elem, .. } => Some(*elem),
+                                _ => None,
+                            });
+                            let elem_shape = elem_ty
+                                .as_ref()
+                                .map(|t| self.shape_of_type(t))
+                                .unwrap_or(TypeShape::Unknown);
+                            let mut s = HashSet::new();
+                            self.collect_sharing_origins_expr(
+                                &cst, chan, &origins, &shadowed, &mut s,
+                            );
+                            for (i, n) in names.iter().enumerate() {
+                                if n == "_" || n.is_empty() {
+                                    continue;
+                                }
+                                let (sh, ty) = if i == 0 {
+                                    (elem_shape.clone(), elem_ty.clone())
+                                } else {
+                                    (TypeShape::Value, None)
+                                };
+                                self.define_binding(&mut cst, n, sh.clone(), ty, false, false, false);
+                                if let Some((_, _, defs)) = scope_stack.last_mut() {
+                                    defs.insert(n.clone());
+                                }
+                                if i == 0
+                                    && (self.shape_may_share(&sh)
+                                        || matches!(sh, TypeShape::Unknown | TypeShape::Array(_)))
+                                {
+                                    let mut ns = s.clone();
+                                    if ns.is_empty() {
+                                        ns.insert(format!("select:{idx}:{n}"));
+                                    }
+                                    origins.insert(n.clone(), ns);
+                                    shadowed.remove(n);
+                                } else {
+                                    origins.remove(n);
+                                    shadowed.insert(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut calls = Vec::new();
             walk::own_calls(stmt, &mut calls);
             for cr in &calls {
@@ -4669,6 +4984,77 @@ impl<'a> Checker<'a> {
                 }
             }
             match stmt {
+                Stmt::For {
+                    kind: ForKind::Iterate { vars, expr },
+                    ..
+                } => {
+                    let container_ty = self.ty_of_expr(&cst, expr);
+                    let mut base_o = HashSet::new();
+                    self.collect_sharing_origins_expr(&cst, expr, &origins, &shadowed, &mut base_o);
+                    for (i, v) in vars.iter().enumerate() {
+                        if v == "_" || v.is_empty() {
+                            continue;
+                        }
+                        let vty = match (&container_ty, vars.len(), i) {
+                            (Some(hy_syntax::TypeExpr::Slice(elem)), 1, 0)
+                            | (Some(hy_syntax::TypeExpr::Slice(elem)), 2, 1)
+                            | (Some(hy_syntax::TypeExpr::Array { elem, .. }), 1, 0)
+                            | (Some(hy_syntax::TypeExpr::Array { elem, .. }), 2, 1)
+                            | (Some(hy_syntax::TypeExpr::Chan { elem, .. }), 1, 0) => {
+                                Some((**elem).clone())
+                            }
+                            (Some(hy_syntax::TypeExpr::Map { key, .. }), _, 0) => {
+                                Some((**key).clone())
+                            }
+                            (Some(hy_syntax::TypeExpr::Map { value, .. }), 2, 1) => {
+                                Some((**value).clone())
+                            }
+                            _ => None,
+                        };
+                        let vshape = vty
+                            .as_ref()
+                            .map(|t| self.shape_of_type(t))
+                            .unwrap_or(TypeShape::Unknown);
+                        self.define_binding(&mut cst, v, vshape.clone(), vty, false, false, false);
+                        if let Some((_, _, defs)) = scope_stack.last_mut() {
+                            defs.insert(v.clone());
+                        }
+                        if self.shape_may_share(&vshape)
+                            || matches!(vshape, TypeShape::Unknown | TypeShape::Array(_))
+                        {
+                            let mut s = base_o.clone();
+                            if s.is_empty() {
+                                s.insert(format!("iter:{idx}:{v}"));
+                            }
+                            origins.insert(v.clone(), s);
+                            shadowed.remove(v);
+                        } else {
+                            origins.remove(v);
+                            shadowed.insert(v.clone());
+                        }
+                    }
+                }
+                Stmt::For {
+                    kind: ForKind::Range { var, .. },
+                    ..
+                } => {
+                    if var != "_" && !var.is_empty() {
+                        self.define_binding(
+                            &mut cst,
+                            var,
+                            TypeShape::Value,
+                            None,
+                            false,
+                            false,
+                            false,
+                        );
+                        if let Some((_, _, defs)) = scope_stack.last_mut() {
+                            defs.insert(var.clone());
+                        }
+                        origins.remove(var);
+                        shadowed.insert(var.clone());
+                    }
+                }
                 Stmt::Local(l) => {
                     let is_let = matches!(l.kind, LocalKind::Let);
                     if l.values.is_empty() {
@@ -4687,6 +5073,9 @@ impl<'a> Checker<'a> {
                                 false,
                                 is_let,
                             );
+                            if let Some((_, _, defs)) = scope_stack.last_mut() {
+                                defs.insert(name.clone());
+                            }
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4713,6 +5102,9 @@ impl<'a> Checker<'a> {
                         );
                         for ((name, shape), ty) in l.names.iter().zip(shapes).zip(tys) {
                             self.define_binding(&mut cst, name, shape.clone(), ty, false, false, is_let);
+                            if let Some((_, _, defs)) = scope_stack.last_mut() {
+                                defs.insert(name.clone());
+                            }
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4752,6 +5144,9 @@ impl<'a> Checker<'a> {
                             .collect();
                         for (name, (shape, ty, mut s)) in l.names.iter().zip(rhs_info) {
                             self.define_binding(&mut cst, name, shape.clone(), ty, false, false, is_let);
+                            if let Some((_, _, defs)) = scope_stack.last_mut() {
+                                defs.insert(name.clone());
+                            }
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4770,6 +5165,16 @@ impl<'a> Checker<'a> {
                 Stmt::Assign {
                     targets, values, ..
                 } => {
+                    let in_branch = !scope_stack.is_empty();
+                    let is_defined_in_inner =
+                        |name: &str,
+                         stack: &[(
+                             HashMap<String, HashSet<String>>,
+                             HashSet<String>,
+                             HashSet<String>,
+                         )]| {
+                            stack.iter().any(|(_, _, defs)| defs.contains(name))
+                        };
                     if targets.len() == values.len() {
                         let rhs_sets: Vec<(
                             TypeShape,
@@ -4812,9 +5217,14 @@ impl<'a> Checker<'a> {
                                         if s.is_empty() {
                                             s.insert(format!("rebind:{idx}:{name}"));
                                         }
-                                        origins.insert(name.clone(), s);
+                                        if in_branch && !is_defined_in_inner(name, &scope_stack) {
+                                            origins.entry(name.clone()).or_default().extend(s);
+                                        } else {
+                                            origins.insert(name.clone(), s);
+                                        }
                                         shadowed.remove(name);
-                                    } else {
+                                    } else if !in_branch || is_defined_in_inner(name, &scope_stack)
+                                    {
                                         origins.remove(name);
                                         shadowed.insert(name.clone());
                                     }
@@ -4847,9 +5257,13 @@ impl<'a> Checker<'a> {
                                     if s.is_empty() {
                                         s.insert(format!("rebind:{idx}:{name}"));
                                     }
-                                    origins.insert(name.clone(), s);
+                                    if in_branch && !is_defined_in_inner(name, &scope_stack) {
+                                        origins.entry(name.clone()).or_default().extend(s);
+                                    } else {
+                                        origins.insert(name.clone(), s);
+                                    }
                                     shadowed.remove(name);
-                                } else {
+                                } else if !in_branch || is_defined_in_inner(name, &scope_stack) {
                                     origins.remove(name);
                                     shadowed.insert(name.clone());
                                 }
@@ -8629,5 +9043,64 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn callee_return_origin_tracks_match_for_scopes_rebinds_and_copy_issue_829() {
+        let src_const_match = "\
+enum Bag {
+    Items(map[string]int),
 }
+
+const SHARED = Bag::Items(map[string]int{\"k\": 1})
+
+fn extract() -> map[string]int {
+    match SHARED {
+        Bag::Items(m) => {
+            return m
+        }
+    }
+}
+
+fn main() {
+    alias := extract()
+    alias[\"k\"] = 2
+}
+";
+        assert!(
+            check_codes(src_const_match).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when callee returns const map via match-arm payload"
+        );
+
+        let src_shared_pair = "\
+enum Bag {
+    Items(map[string]int),
+}
+
+fn make_pair() -> (map[string]int, map[string]int) {
+    m := map[string]int{\"k\": 1}
+    b := Bag::Items(m)
+    match b {
+        Bag::Items(inner) => {
+            return m, inner
+        }
+    }
+}
+
+fn worker(owned map[string]int) {
+    owned[\"k\"] = 2
+}
+
+fn main() {
+    a, b := make_pair()
+    task worker(move a)
+    b[\"k\"] = 3
+}
+";
+        assert!(
+            check_codes(src_shared_pair).iter().any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when callee returns shared pair via match-arm payload"
+        );
+    }
+}
+
 

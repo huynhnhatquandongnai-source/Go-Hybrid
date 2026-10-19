@@ -3655,6 +3655,8 @@ impl<'a> Checker<'a> {
                     self.collect_callee_const_return_roots(st, value, &mut roots, 0);
                     let mut borrowed_roots = Vec::new();
                     self.collect_borrowed_roots(st, value, &mut borrowed_roots);
+                    let mut chosen_src: Option<String> = None;
+                    let mut chosen_origin: Option<String> = None;
                     for src in roots {
                         if src == name {
                             continue;
@@ -3670,13 +3672,22 @@ impl<'a> Checker<'a> {
                             (ok, b.non_owned_origin.clone())
                         });
                         if let Some((true, origin)) = matched {
-                            st.aliases.insert(name.to_string(), src.clone());
-                            if let Some(origin) = origin {
-                                if let Some(nb) = st.env_lookup_mut(name) {
-                                    nb.non_owned_origin = Some(origin);
-                                }
+                            if chosen_src.is_none() {
+                                chosen_src = Some(src.clone());
                             }
-                            break;
+                            if origin.is_some() {
+                                chosen_src = Some(src);
+                                chosen_origin = origin;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(src) = chosen_src {
+                        st.aliases.insert(name.to_string(), src);
+                        if let Some(origin) = chosen_origin {
+                            if let Some(nb) = st.env_lookup_mut(name) {
+                                nb.non_owned_origin = Some(origin);
+                            }
                         }
                     }
                 }
@@ -6521,12 +6532,18 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-            } else if method_name == "pop"
+            } else if (method_name == "pop"
                 && cr.args.is_empty()
                 && matches!(
                     self.shape_of_expr(st, base),
                     TypeShape::Slice(_) | TypeShape::Unknown
-                )
+                ))
+                || ((method_name == "insert" || method_name == "remove")
+                    && cr.args.len() == 1
+                    && matches!(
+                        self.shape_of_expr(st, base),
+                        TypeShape::Struct(Some(ref s)) if s == "set" || s.starts_with("set[")
+                    ))
             {
                 let recv_const = base
                     .root_ident()
@@ -7219,6 +7236,8 @@ impl<'a> Checker<'a> {
                     && ((method_name == "pop"
                         && cr.args.is_empty()
                         && !matches!(crate::model::unwrap_parens(base), Expr::Ident { .. }))
+                        || ((method_name == "insert" || method_name == "remove")
+                            && cr.args.len() == 1)
                         || matching.is_empty()
                         || matching.iter().any(|d| {
                             d.receiver
@@ -8627,6 +8646,42 @@ fn main() {
         assert!(
             check_codes(src_a6).iter().any(|c| c == "HYB-E3103"),
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
+        );
+    }
+
+    #[test]
+    fn set_and_option_prelude_methods_issue_884() {
+        let src_const_set_insert = "\
+fn main() {
+    const s = set.new[int]()
+    s.insert(1)
+}
+";
+        assert!(
+            check_codes(src_const_set_insert)
+                .iter()
+                .any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when calling .insert() on a const set[T]"
+        );
+
+        let src_option_unwrap_alias = "\
+fn worker(m map[string]int) {
+    m[\"k\"] = 2
+}
+
+fn main() {
+    m := map[string]int{\"k\": 1}
+    opt := some(m)
+    alias := opt.unwrap()
+    task worker(move alias)
+    m[\"k\"] = 3
+}
+";
+        assert!(
+            check_codes(src_option_unwrap_alias)
+                .iter()
+                .any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when moving an alias obtained via opt.unwrap() and using the original binding"
         );
     }
 }

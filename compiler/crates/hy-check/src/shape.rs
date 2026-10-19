@@ -86,6 +86,9 @@ impl<'a> Checker<'a> {
         if let Some(target) = self.type_aliases.get(base) {
             return self.shape_of_type_depth(target, depth + 1);
         }
+        if base == "set" {
+            return TypeShape::Struct(Some(name.to_string()));
+        }
         match name {
             "int" | "i8" | "int8" | "i16" | "int16" | "i32" | "int32" | "i64" | "int64" | "u8"
             | "uint8" | "u16" | "uint16" | "u32" | "uint32" | "u64" | "uint64" | "usize"
@@ -129,6 +132,7 @@ impl<'a> Checker<'a> {
         }
         match shape {
             TypeShape::Array(elem) => self.shape_may_share_at(elem, depth + 1),
+            TypeShape::Struct(Some(name)) if name == "set" || name.starts_with("set[") => true,
             TypeShape::Struct(Some(name)) => self
                 .structs
                 .get(name)
@@ -418,6 +422,20 @@ impl<'a> Checker<'a> {
                 if name == "pop" && args.is_empty() {
                     if let TypeShape::Slice(elem) = &recv {
                         return (**elem).clone();
+                    }
+                }
+                if let TypeShape::Option(elem) = &recv {
+                    match name.as_str() {
+                        "unwrap" if args.is_empty() => return (**elem).clone(),
+                        "or" if args.len() == 1 => return (**elem).clone(),
+                        "is_some" | "is_none" if args.is_empty() => return TypeShape::Primitive,
+                        _ => {}
+                    }
+                }
+                if matches!(&recv, TypeShape::Struct(Some(s)) if s == "set" || s.starts_with("set[")) {
+                    match name.as_str() {
+                        "insert" | "remove" | "contains" | "len" => return TypeShape::Primitive,
+                        _ => {}
                     }
                 }
                 if let Some(recv_base) = self
@@ -750,6 +768,24 @@ impl<'a> Checker<'a> {
                             let full = format!("{}.{}", root, head);
                             if let Some(f) = self.fns.get(full.as_str()) {
                                 return f.results.first().map(|r| r.ty.clone());
+                            }
+                        }
+                    }
+                    if let Some(base_ty) = self
+                        .ty_of_expr(st, base)
+                        .map(|t| self.resolve_type_alias(&t))
+                    {
+                        if let TypeExpr::Option { elem, .. } = base_ty {
+                            match name.as_str() {
+                                "unwrap" if args.is_empty() => return Some(*elem),
+                                "or" if args.len() == 1 => return Some(*elem),
+                                "is_some" | "is_none" if args.is_empty() => {
+                                    return Some(TypeExpr::Named {
+                                        name: "bool".to_string(),
+                                        span: *span,
+                                    });
+                                }
+                                _ => {}
                             }
                         }
                     }

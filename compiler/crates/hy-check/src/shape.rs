@@ -80,7 +80,7 @@ impl<'a> Checker<'a> {
         let base = Self::base_named_type_str(name);
         // User structs in package scope take precedence over predeclared types.
         if self.structs.contains_key(base) {
-            return TypeShape::Struct(Some(base.to_string()));
+            return TypeShape::Struct(Some(name.to_string()));
         }
         // User type aliases take precedence over predeclared types.
         if let Some(target) = self.type_aliases.get(base) {
@@ -130,8 +130,7 @@ impl<'a> Checker<'a> {
         match shape {
             TypeShape::Array(elem) => self.shape_may_share_at(elem, depth + 1),
             TypeShape::Struct(Some(name)) => self
-                .structs
-                .get(name)
+                .struct_fields_for_sname(name)
                 .map(|fields| {
                     fields
                         .iter()
@@ -169,8 +168,7 @@ impl<'a> Checker<'a> {
                     || self.shape_carries_handle_at(v, depth + 1)
             }
             TypeShape::Struct(Some(name)) => self
-                .structs
-                .get(name)
+                .struct_fields_for_sname(name)
                 .map(|fields| {
                     fields.iter().any(|(_, ty)| {
                         self.shape_carries_handle_at(&self.shape_of_type(ty), depth + 1)
@@ -184,8 +182,7 @@ impl<'a> Checker<'a> {
     /// Does this struct decl guard something with a `sync.*` lock? (Used for
     /// the contested-04 note: "Tier 0 does not credit locks at spawn sites".)
     pub(crate) fn struct_has_mutex_field(&self, sname: &str) -> bool {
-        self.structs
-            .get(sname)
+        self.struct_fields_for_sname(sname)
             .map(|fields| {
                 fields.iter().any(|(_, ty)| {
                     matches!(
@@ -301,10 +298,9 @@ impl<'a> Checker<'a> {
     pub(crate) fn field_shape(&self, base: &TypeShape, field: &str) -> TypeShape {
         match base {
             TypeShape::Struct(Some(sname)) => self
-                .structs
-                .get(sname)
-                .and_then(|fs| fs.iter().find(|(n, _)| n == field))
-                .map(|(_, t)| self.shape_of_type(t))
+                .struct_fields_for_sname(sname)
+                .and_then(|fs| fs.into_iter().find(|(n, _)| n == field))
+                .map(|(_, t)| self.shape_of_type(&t))
                 .unwrap_or(TypeShape::Unknown),
             TypeShape::Pointer(inner) => self.field_shape(inner, field),
             _ => TypeShape::Unknown,
@@ -369,10 +365,9 @@ impl<'a> Checker<'a> {
                                     TypeShape::Unknown
                                 }
                             }
-                            Some(Expr::Index { base, .. }) => {
-                                if let Expr::Ident { name, .. } = crate::model::unwrap_parens(base)
-                                {
-                                    self.named_shape(name)
+                            Some(idx_expr @ Expr::Index { base, .. }) => {
+                                if matches!(crate::model::unwrap_parens(base), Expr::Ident { .. }) {
+                                    self.named_shape(&idx_expr.render())
                                 } else {
                                     TypeShape::Unknown
                                 }
@@ -640,11 +635,9 @@ impl<'a> Checker<'a> {
                         });
                     }
                 }
-                let sname = Self::base_named_type(&resolved)?;
-                self.structs
-                    .get(&sname)
-                    .and_then(|fs| fs.iter().find(|(n, _)| n == name))
-                    .map(|(_, t)| t.clone())
+                self.struct_fields_for_type(&resolved)
+                    .and_then(|fs| fs.into_iter().find(|(n, _)| n == name))
+                    .map(|(_, t)| t)
             }
             Expr::Index { base, .. } => {
                 let base_ty = self.ty_of_expr(st, base)?;
@@ -833,8 +826,8 @@ impl<'a> Checker<'a> {
                         base
                     ));
                 }
-                if let Some(fields) = self.structs.get(base) {
-                    for (fname, fty) in fields {
+                if let Some(fields) = self.struct_fields_for_sname(name) {
+                    for (fname, fty) in &fields {
                         if let Some(inner) = self.no_zero_value_reason(fty, depth + 1) {
                             return Some(format!(
                                 "struct `{}` has no zero value because field `{}` ({})",

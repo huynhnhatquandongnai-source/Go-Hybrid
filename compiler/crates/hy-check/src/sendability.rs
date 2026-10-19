@@ -168,7 +168,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -200,7 +200,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -227,7 +227,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -656,9 +656,11 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 let recv_base = match self.shape_of_expr(st, base) {
-                    TypeShape::Struct(Some(s)) => Some(s),
+                    TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(&s).to_string()),
                     TypeShape::Pointer(inner) => match *inner {
-                        TypeShape::Struct(Some(s)) => Some(s),
+                        TypeShape::Struct(Some(s)) => {
+                            Some(Self::base_named_type_str(&s).to_string())
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -687,7 +689,9 @@ impl<'a> Checker<'a> {
             (Struct(None), _) | (_, Struct(None)) => true,
             (ForeignOpaque(_), _) | (_, ForeignOpaque(_)) => true,
             (Primitive, Primitive) | (Str, Str) | (Atomic, Atomic) => true,
-            (Struct(Some(a)), Struct(Some(b))) => a == b,
+            (Struct(Some(a)), Struct(Some(b))) => {
+                Self::base_named_type_str(a) == Self::base_named_type_str(b)
+            }
             (Map(_, _), Map(_, _)) => true,
             (Slice(_), Slice(_)) | (Array(_), Array(_)) => true,
             // Go converts between slice and array of the same element class
@@ -1011,7 +1015,7 @@ impl<'a> Checker<'a> {
                         _ => None,
                     }
                 }) {
-                    if let Some(def) = self.structs.get(&sname).cloned() {
+                    if let Some(def) = self.struct_fields_for_sname(&sname) {
                         for f in fields {
                             if let Some((_, fty)) = def.iter().find(|(n, _)| n == &f.name) {
                                 if Checker::is_nil_literal(&f.value) {
@@ -2184,7 +2188,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn parse_generic_type_args(name: &str) -> Option<(&str, Vec<hy_syntax::TypeExpr>)> {
+    pub(crate) fn parse_generic_type_args(name: &str) -> Option<(&str, Vec<hy_syntax::TypeExpr>)> {
         let open = name.find('[')?;
         if !name.ends_with(']') || open == 0 {
             return None;
@@ -2225,7 +2229,7 @@ impl<'a> Checker<'a> {
         Some((base, parsed))
     }
 
-    fn substitute_type_params(
+    pub(crate) fn substitute_type_params(
         ty: &hy_syntax::TypeExpr,
         subst: &std::collections::HashMap<String, hy_syntax::TypeExpr>,
     ) -> hy_syntax::TypeExpr {
@@ -2308,23 +2312,29 @@ impl<'a> Checker<'a> {
         cur
     }
 
-    fn struct_fields_for_type(
+    pub(crate) fn struct_fields_for_sname(
         &self,
-        ty: &hy_syntax::TypeExpr,
+        sname: &str,
     ) -> Option<Vec<(String, hy_syntax::TypeExpr)>> {
-        let peeled = self.peel_pointer_and_alias(ty);
-        let hy_syntax::TypeExpr::Named { name, .. } = &peeled else {
-            return None;
-        };
-        let sname = Self::base_named_type_str(name);
-        let fields = self.structs.get(sname)?.clone();
-        if let Some((_, type_args)) = Self::parse_generic_type_args(name) {
-            if let Some(sdecl) = self.file.decls.iter().find_map(|d| match d {
-                hy_syntax::Decl::Struct(s) if s.name == sname => Some(s),
-                _ => None,
-            }) {
+        let mut cur = sname.to_string();
+        for _ in 0..8 {
+            let base = Self::base_named_type_str(&cur);
+            if self.structs.contains_key(base) {
+                break;
+            }
+            match self.type_aliases.get(base) {
+                Some(hy_syntax::TypeExpr::Named { name, .. }) if name != &cur => {
+                    cur = name.clone();
+                }
+                _ => break,
+            }
+        }
+        let base = Self::base_named_type_str(&cur);
+        let fields = self.structs.get(base)?.clone();
+        if let Some((_, type_args)) = Self::parse_generic_type_args(&cur) {
+            if let Some(tparams) = self.struct_type_params.get(base) {
                 let mut subst = std::collections::HashMap::new();
-                for (tp, arg) in sdecl.type_params.iter().zip(type_args.iter()) {
+                for (tp, arg) in tparams.iter().zip(type_args.iter()) {
                     subst.insert(tp.name.clone(), arg.clone());
                 }
                 if !subst.is_empty() {
@@ -2338,6 +2348,17 @@ impl<'a> Checker<'a> {
             }
         }
         Some(fields)
+    }
+
+    pub(crate) fn struct_fields_for_type(
+        &self,
+        ty: &hy_syntax::TypeExpr,
+    ) -> Option<Vec<(String, hy_syntax::TypeExpr)>> {
+        let peeled = self.peel_pointer_and_alias(ty);
+        let hy_syntax::TypeExpr::Named { name, .. } = &peeled else {
+            return None;
+        };
+        self.struct_fields_for_sname(name)
     }
 
     fn infer_type_param_bindings(

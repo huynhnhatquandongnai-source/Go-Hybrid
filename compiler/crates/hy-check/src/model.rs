@@ -312,23 +312,44 @@ impl FnState {
         self.fnlit_scopes.push(Vec::new());
     }
 
+    /// Snapshot the current visible environment for a closure literal at `pos`.
+    pub(crate) fn snapshot_fnlit(&mut self, pos: (usize, usize)) {
+        let mut snap_env = self.env.clone();
+        for layer in &self.scopes {
+            for (k, v) in layer {
+                snap_env.insert(k.clone(), v.clone());
+            }
+        }
+        let snap_aliases = self.aliases.clone();
+        let snap_share = self.may_share.clone();
+        self.closure_scoped_envs
+            .entry(pos)
+            .and_modify(|(e, a, s)| {
+                for (k, v) in &snap_env {
+                    let prev_moved = e.get(k).and_then(|b| b.moved.clone());
+                    let prev_origin = e.get(k).and_then(|b| b.non_owned_origin.clone());
+                    let mut merged = v.clone();
+                    if merged.moved.is_none() {
+                        merged.moved = prev_moved;
+                    }
+                    if merged.non_owned_origin.is_none() {
+                        merged.non_owned_origin = prev_origin;
+                    }
+                    e.insert(k.clone(), merged);
+                }
+                *a = snap_aliases.clone();
+                for (k, vs) in &snap_share {
+                    s.entry(k.clone()).or_default().extend(vs.iter().cloned());
+                }
+            })
+            .or_insert((snap_env, snap_aliases, snap_share));
+    }
+
     /// Exit the innermost block scope (walk.rs's Pop events).
     pub(crate) fn scope_pop(&mut self) {
         if let Some(fnlits) = self.fnlit_scopes.pop() {
-            if !fnlits.is_empty() {
-                let mut snap_env = self.env.clone();
-                for layer in &self.scopes {
-                    for (k, v) in layer {
-                        snap_env.insert(k.clone(), v.clone());
-                    }
-                }
-                let snap_aliases = self.aliases.clone();
-                let snap_share = self.may_share.clone();
-                for pos in fnlits {
-                    self.closure_scoped_envs.entry(pos).or_insert_with(|| {
-                        (snap_env.clone(), snap_aliases.clone(), snap_share.clone())
-                    });
-                }
+            for pos in fnlits {
+                self.snapshot_fnlit(pos);
             }
         }
         let popped_scope = self.scopes.last().cloned().unwrap_or_default();

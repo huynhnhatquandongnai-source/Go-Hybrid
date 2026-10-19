@@ -1,4 +1,4 @@
-﻿use hy_check::{check_file, Verdict};
+use hy_check::{check_file, Verdict};
 use hy_syntax::parse_file;
 
 fn check(src: &str) -> hy_check::CheckResult {
@@ -506,3 +506,108 @@ fn main() {
     assert_eq!(res_a6.verdict, Verdict::Reject);
     assert!(codes(&res_a6).contains(&"HYB-E3103".to_string()));
 }
+
+#[test]
+fn closure_use_after_move_not_erased_by_post_closure_rebind_or_block_scope() {
+    // Variant A: move m -> closure mutates m -> m rebound to fresh map
+    let r_rebind = check(
+        r#"
+fn worker(m map[string]int, done chan int) {
+    m["w"] = 1
+    done <- 1
+}
+
+fn main() {
+    done := make(chan int, 1)
+    m := map[string]int{"k": 0}
+    task worker(move m, done)
+    f := fn() {
+        m["k"] = 99
+    }
+    f()
+    m = map[string]int{"k": 2}
+    _ = m
+    <-done
+}
+"#,
+    );
+    assert_eq!(r_rebind.verdict, Verdict::Reject, "{:?}", r_rebind.diagnostics);
+    assert!(r_rebind.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+    // Variant B: closure defined in inner block -> move m in outer scope
+    let r_block = check(
+        r#"
+fn worker(m map[string]int, done chan int) {
+    m["w"] = 1
+    done <- 1
+}
+
+fn main() {
+    done := make(chan int, 1)
+    m := map[string]int{"k": 0}
+    fns := []fn(){}
+    if true {
+        fns = append(fns, fn() {
+            m["k"] = 99
+        })
+    }
+    task worker(move m, done)
+    fns[0]()
+    <-done
+}
+"#,
+    );
+    assert_eq!(r_block.verdict, Verdict::Reject, "{:?}", r_block.diagnostics);
+    assert!(r_block.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+    // Variant C: loop back-edge IIFE mutates moved m before rebind
+    let r_loop = check(
+        r#"
+fn worker(m map[string]int, done chan int) {
+    m["w"] = 1
+    done <- 1
+}
+
+fn main() {
+    done := make(chan int, 2)
+    m := map[string]int{"k": 0}
+    for i in 0..2 {
+        (fn() {
+            m["k"] = i
+        })()
+        m = map[string]int{"k": i + 1}
+        task worker(move m, done)
+    }
+    <-done
+    <-done
+}
+"#,
+    );
+    assert_eq!(r_loop.verdict, Verdict::Reject, "{:?}", r_loop.diagnostics);
+    assert!(r_loop.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+    // Negative control: rebind m BEFORE defining and calling the closure
+    let r_ok = check(
+        r#"
+fn worker(m map[string]int, done chan int) {
+    m["w"] = 1
+    done <- 1
+}
+
+fn main() {
+    done := make(chan int, 1)
+    m := map[string]int{"k": 0}
+    task worker(move m, done)
+    m = map[string]int{"k": 2}
+    f := fn() {
+        m["k"] = 99
+    }
+    f()
+    _ = m
+    <-done
+}
+"#,
+    );
+    assert_eq!(r_ok.verdict, Verdict::Accept, "{:?}", r_ok.diagnostics);
+}
+

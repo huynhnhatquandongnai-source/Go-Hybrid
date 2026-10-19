@@ -528,10 +528,12 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         let mut fnlits = Vec::new();
         walk::own_fnlits(stmt, &mut fnlits);
         if !fnlits.is_empty() {
-            if let Some(top) = st.fnlit_scopes.last_mut() {
-                for fl in fnlits {
-                    let sp = fl.span();
-                    top.push((sp.start.line as usize, sp.start.col as usize));
+            for fl in fnlits {
+                let sp = fl.span();
+                let pos = (sp.start.line as usize, sp.start.col as usize);
+                st.snapshot_fnlit(pos);
+                if let Some(top) = st.fnlit_scopes.last_mut() {
+                    top.push(pos);
                 }
             }
         }

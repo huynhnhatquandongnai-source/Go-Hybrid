@@ -2407,6 +2407,14 @@ impl<'a> Checker<'a> {
                             .unwrap_or(false)
                     {
                         st.share_edge(name, &id);
+                        if let Some(mv) = self.lookup_binding(st, &id).and_then(|b| b.moved.clone())
+                        {
+                            if let Some(cb) = st.env_lookup_mut(name) {
+                                if cb.moved.is_none() {
+                                    cb.moved = Some(mv);
+                                }
+                            }
+                        }
                     }
                 }
             }

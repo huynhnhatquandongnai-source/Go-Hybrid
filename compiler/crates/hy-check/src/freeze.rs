@@ -326,10 +326,11 @@ impl<'a> Checker<'a> {
                 shadow_targets.extend(links.iter().cloned());
             }
         }
-        for (m, orig) in members.iter().zip(origins) {
+        for (m, orig) in members.iter().zip(origins.iter()) {
+            let cur_shape = st.env_lookup(m).map(|b| b.shape.clone());
             if let Some(b) = st.env_lookup_mut(m) {
                 if b.non_owned_origin.is_none() {
-                    b.non_owned_origin = orig;
+                    b.non_owned_origin = orig.clone();
                 }
                 b.moved = Some(MoveInfo {
                     span,
@@ -347,6 +348,23 @@ impl<'a> Checker<'a> {
                         moved_name: name.to_string(),
                     });
                     st.env.insert(m.clone(), frozen);
+                }
+            }
+            for (snap_env, _, _) in st.closure_scoped_envs.values_mut() {
+                if let Some(sb) = snap_env.get_mut(m) {
+                    if cur_shape.as_ref().map(|cs| &sb.shape == cs).unwrap_or(true) {
+                        if sb.non_owned_origin.is_none() {
+                            sb.non_owned_origin = orig.clone();
+                        }
+                        if sb.moved.is_none() {
+                            sb.moved = Some(MoveInfo {
+                                span,
+                                kind,
+                                desc: desc.clone(),
+                                moved_name: name.to_string(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -714,6 +732,36 @@ impl<'a> Checker<'a> {
                 }
             } else {
                 crate::walk::own_uses(stmt, &mut uses);
+                let mut fnlits = Vec::new();
+                crate::walk::own_fnlits(stmt, &mut fnlits);
+                for fl in fnlits {
+                    if let hy_syntax::Expr::FnLit {
+                        params,
+                        results,
+                        body,
+                        ..
+                    } = crate::model::unwrap_parens(fl)
+                    {
+                        let mut bound: HashSet<String> =
+                            params.iter().map(|p| p.name.clone()).collect();
+                        bound.extend(results.iter().filter_map(|r| r.name.clone()));
+                        let fl_flat = crate::walk::flatten(body);
+                        for (cstmt, _) in &fl_flat.stmts {
+                            if let hy_syntax::Stmt::Local(l) = cstmt {
+                                for n in &l.names {
+                                    bound.insert(n.clone());
+                                }
+                            }
+                            let mut cuses = Vec::new();
+                            crate::walk::own_uses(cstmt, &mut cuses);
+                            for cu in cuses {
+                                if !bound.contains(&cu.name) {
+                                    uses.push(cu);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let hy_syntax::Stmt::Select { arms, .. } = stmt {
                     for arm in arms {
                         match &arm.kind {

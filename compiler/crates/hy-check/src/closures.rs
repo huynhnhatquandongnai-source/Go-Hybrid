@@ -40,7 +40,18 @@ pub(crate) fn check_closure_boundaries(ck: &mut Checker<'_>, st: &FnState, body:
         let st_ref = if let Some((s_env, s_aliases, s_share)) = st.closure_scoped_envs.get(&pos) {
             scoped_st = st.clone();
             for (k, v) in s_env {
-                scoped_st.env.insert(k.clone(), v.clone());
+                let mut merged = v.clone();
+                if let Some(outer_b) = scoped_st.env.get(k) {
+                    if merged.shape == outer_b.shape {
+                        if merged.moved.is_none() {
+                            merged.moved = outer_b.moved.clone();
+                        }
+                        if merged.non_owned_origin.is_none() {
+                            merged.non_owned_origin = outer_b.non_owned_origin.clone();
+                        }
+                    }
+                }
+                scoped_st.env.insert(k.clone(), merged);
             }
             for (k, v) in s_aliases {
                 scoped_st.aliases.insert(k.clone(), v.clone());

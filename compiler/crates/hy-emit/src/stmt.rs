@@ -1965,8 +1965,11 @@ impl Emitter {
                 self.hoist_tries_expr(v)?;
             }
         }
-        // Inside a function literal the closure owns the return — plain.
-        if self.fnlit_depth > 0 {
+        // Inside a function literal without option/conv lowering, emit plain return.
+        if self.fnlit_depth > 0
+            && self.cur_option_result.is_none()
+            && self.cur_fn_conv_result.is_none()
+        {
             let vs = values
                 .iter()
                 .map(|v| self.emit_expr(v, 0))

@@ -6721,6 +6721,15 @@ impl<'a> Checker<'a> {
         roots.iter().any(|r| aliases.contains(r))
     }
 
+    fn expr_takes_const_slot_or_field_loan(expr: &Expr, aliases: &HashSet<String>) -> bool {
+        let Some(operand) = as_addr_of(crate::model::unwrap_parens(expr)) else {
+            return false;
+        };
+        let operand = crate::model::unwrap_parens(operand);
+        matches!(operand, Expr::Index { .. } | Expr::Field { .. })
+            && Self::expr_reaches_const_aliases(operand, aliases)
+    }
+
     fn stmt_mutates_const_param(
         &self,
         stmt: &Stmt,
@@ -6739,7 +6748,9 @@ impl<'a> Checker<'a> {
                     }
                 }
                 for v in values {
-                    if self.expr_fnlit_mutates_const_param(v, aliases, depth) {
+                    if Self::expr_takes_const_slot_or_field_loan(v, aliases)
+                        || self.expr_fnlit_mutates_const_param(v, aliases, depth)
+                    {
                         return true;
                     }
                 }
@@ -6778,7 +6789,9 @@ impl<'a> Checker<'a> {
             }
             Stmt::Local(l) => {
                 for v in &l.values {
-                    if self.expr_fnlit_mutates_const_param(v, aliases, depth) {
+                    if Self::expr_takes_const_slot_or_field_loan(v, aliases)
+                        || self.expr_fnlit_mutates_const_param(v, aliases, depth)
+                    {
                         return true;
                     }
                 }
@@ -8629,5 +8642,48 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn interprocedural_slot_loan_on_const_param_rejects_e3006() {
+        let src_define_loan = "\
+const SHARED = map[string]int{\"k\": 1}
+
+fn overwrite(m map[string]int, v int) {
+    s := &m[\"k\"]
+    s = v
 }
+
+fn main() {
+    overwrite(SHARED, 99)
+}
+";
+        assert!(
+            check_codes(src_define_loan).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when callee takes O8 map-slot loan on const map parameter and overwrites it"
+        );
+
+        let src_assign_loan = "\
+struct Entry {
+    n int
+}
+
+const SHARED = map[string]Entry{\"k\": Entry{n: 1}}
+
+fn overwrite_entry(m map[string]Entry, v int) {
+    var s Entry
+    s = &m[\"k\"]
+    s = Entry{n: v}
+}
+
+fn main() {
+    overwrite_entry(SHARED, 99)
+}
+";
+        assert!(
+            check_codes(src_assign_loan).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when callee assigns O8 map-slot loan on const map parameter"
+        );
+    }
+}
+
 

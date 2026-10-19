@@ -40,7 +40,16 @@ pub(crate) fn check_closure_boundaries(ck: &mut Checker<'_>, st: &FnState, body:
         let st_ref = if let Some((s_env, s_aliases, s_share)) = st.closure_scoped_envs.get(&pos) {
             scoped_st = st.clone();
             for (k, v) in s_env {
-                scoped_st.env.insert(k.clone(), v.clone());
+                let mut merged = v.clone();
+                if let Some(post_b) = scoped_st.env.get(k) {
+                    if merged.moved.is_none() {
+                        merged.moved = post_b.moved.clone();
+                    }
+                    if merged.non_owned_origin.is_none() {
+                        merged.non_owned_origin = post_b.non_owned_origin.clone();
+                    }
+                }
+                scoped_st.env.insert(k.clone(), merged);
             }
             for (k, v) in s_aliases {
                 scoped_st.aliases.insert(k.clone(), v.clone());
@@ -51,6 +60,29 @@ pub(crate) fn check_closure_boundaries(ck: &mut Checker<'_>, st: &FnState, body:
                     .entry(k.clone())
                     .or_default()
                     .extend(vs.iter().cloned());
+            }
+            let all_keys: Vec<String> = scoped_st.env.keys().cloned().collect();
+            for k in &all_keys {
+                let (mv, orig) = scoped_st
+                    .env
+                    .get(k)
+                    .map(|b| (b.moved.clone(), b.non_owned_origin.clone()))
+                    .unwrap_or((None, None));
+                if mv.is_none() && orig.is_none() {
+                    continue;
+                }
+                let mut peers = ck.storage_peers(&scoped_st, k);
+                peers.push(crate::freeze::resolve_alias(&scoped_st, k));
+                for peer in peers {
+                    if let Some(pb) = scoped_st.env.get_mut(&peer) {
+                        if pb.moved.is_none() {
+                            pb.moved = mv.clone();
+                        }
+                        if pb.non_owned_origin.is_none() {
+                            pb.non_owned_origin = orig.clone();
+                        }
+                    }
+                }
             }
             &scoped_st
         } else {

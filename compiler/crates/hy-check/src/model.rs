@@ -332,6 +332,27 @@ impl FnState {
             }
         }
         let popped_scope = self.scopes.last().cloned().unwrap_or_default();
+        if !self.closure_scoped_envs.is_empty() {
+            for (k, b) in self
+                .env
+                .iter()
+                .chain(self.scopes.iter().flat_map(|s| s.iter()))
+            {
+                if b.moved.is_none() && b.non_owned_origin.is_none() {
+                    continue;
+                }
+                for (s_env, _, _) in self.closure_scoped_envs.values_mut() {
+                    if let Some(sb) = s_env.get_mut(k) {
+                        if sb.moved.is_none() {
+                            sb.moved = b.moved.clone();
+                        }
+                        if sb.non_owned_origin.is_none() {
+                            sb.non_owned_origin = b.non_owned_origin.clone();
+                        }
+                    }
+                }
+            }
+        }
         let exists_in_outer = |name: &str, env: &HashMap<String, Binding>, scopes: &[HashMap<String, Binding>]| {
             env.contains_key(name) || scopes.iter().rev().skip(1).any(|s| s.contains_key(name))
         };

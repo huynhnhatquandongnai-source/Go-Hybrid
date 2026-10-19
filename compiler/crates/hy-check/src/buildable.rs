@@ -689,9 +689,13 @@ impl<'a> Collector<'a> {
                 self.check_assign_operands(targets, *op, values, *span);
             }
             Stmt::Expr { expr, .. } => self.expr(expr),
-            Stmt::Send { chan, value, .. } => {
+            Stmt::Send {
+                chan, value, span, ..
+            } => {
                 self.expr(chan);
                 self.expr(value);
+                self.check_single_value_position(value, "a channel send", /*binding_position=*/ false);
+                self.check_chan_send_operand(chan, value, *span);
             }
             Stmt::If {
                 init,
@@ -752,11 +756,25 @@ impl<'a> Collector<'a> {
                 }
                 self.check_return(values, *span);
             }
-            Stmt::Task { callee, args, .. } => {
+            Stmt::Task {
+                callee, args, span, ..
+            } => {
                 self.expr(callee);
                 for a in args {
                     self.expr(&a.value);
                 }
+                if self.multi_value_arg_count(args).is_none() {
+                    for a in args {
+                        self.check_single_value_position(
+                            &a.value,
+                            "a task argument",
+                            /*binding_position=*/ false,
+                        );
+                    }
+                } else {
+                    self.check_multi_value_arg_arity(callee, args, *span);
+                }
+                self.check_call_operands(callee, args, *span);
             }
             Stmt::Managed { body, .. } => self.block_scoped(body),
             Stmt::Match { subject, arms, .. } => {
@@ -795,6 +813,12 @@ impl<'a> Collector<'a> {
                         SelectArmKind::Send { chan, value, .. } => {
                             self.expr(chan);
                             self.expr(value);
+                            self.check_single_value_position(
+                                value,
+                                "a channel send",
+                                /*binding_position=*/ false,
+                            );
+                            self.check_chan_send_operand(chan, value, value.span());
                         }
                         SelectArmKind::Recv { names, chan } => {
                             self.check_repeated_bindings(names, chan.span());
@@ -1003,6 +1027,8 @@ impl<'a> Collector<'a> {
                 }
                 if let Some((_, inner_elem, _)) = e.as_array_lit() {
                     self.check_array_lit_items(inner_elem, items);
+                } else if let Some(t) = elem {
+                    self.check_slice_lit_items(t, items);
                 }
             }
             Expr::MapLit {
@@ -1017,6 +1043,7 @@ impl<'a> Collector<'a> {
                     self.expr(k);
                     self.expr(v);
                 }
+                self.check_map_lit_entries(key, value, entries);
             }
             Expr::FnLit {
                 params,
@@ -2519,6 +2546,24 @@ impl<'a> Collector<'a> {
             );
             return;
         }
+        if let OpKind::Map(key_kind, _) = bk {
+            if **key_kind != OpKind::Unknown
+                && *ik != OpKind::Unknown
+                && kinds_conflict(key_kind, ik)
+            {
+                self.emit_e1002(
+                    index.span(),
+                    format!(
+                        "cannot use `{}` (type `{}`) as `{}` map key on `{}` (HYB-E1002)",
+                        index.render(),
+                        ik.label(),
+                        key_kind.label(),
+                        bk.label()
+                    ),
+                    "map index expression must be assignable to the map's key type",
+                );
+            }
+        }
         // For slices, arrays, and strings, the index must be an integer.
         let needs_int_idx = matches!(bk, OpKind::Slice(_) | OpKind::Array(_) | OpKind::Str)
             || matches!(bk, OpKind::Pointer(inner) if matches!(**inner, OpKind::Array(_)));
@@ -2709,6 +2754,179 @@ impl<'a> Collector<'a> {
             return None;
         }
         self.ck.const_string_len_at(e, use_pos, 0)
+    }
+
+    fn check_chan_send_operand(&mut self, chan: &Expr, value: &Expr, span: Span) {
+        let OpKind::Chan(elem_kind) = self.kind_of_expr(chan) else {
+            return;
+        };
+        if *elem_kind == OpKind::Unknown {
+            return;
+        }
+        let val_expr = match unwrap_parens(value) {
+            Expr::Move { operand, .. } => operand.as_ref(),
+            other => other,
+        };
+        if matches!(val_expr, Expr::Lit { kind: LitKind::Nil, .. }) {
+            return;
+        }
+        let vk = self.kind_of_expr(val_expr);
+        if vk == OpKind::Unknown {
+            return;
+        }
+        if *elem_kind == OpKind::Float
+            && vk == OpKind::Int
+            && crate::const_overflow::const_int_value(val_expr).is_some()
+        {
+            return;
+        }
+        if kinds_conflict(&elem_kind, &vk) {
+            self.emit_e1002(
+                span,
+                format!(
+                    "cannot send `{}` (type `{}`) to channel `{}` of element type `{}` (HYB-E1002)",
+                    value.render(),
+                    vk.label(),
+                    chan.render(),
+                    elem_kind.label()
+                ),
+                "the value sent on `ch <- v` must be assignable to the channel's element type",
+            );
+        }
+    }
+
+    fn check_slice_lit_items(&mut self, elem_ty: &TypeExpr, items: &[Expr]) {
+        let resolved_ty = self.ck.resolve_type_alias(elem_ty);
+        let expected = self.kind_of_ty(&resolved_ty, 0);
+        for item in items {
+            self.check_single_value_position(item, "a slice literal element", /*binding_position=*/ false);
+            if expected == OpKind::Unknown {
+                continue;
+            }
+            let bare = unwrap_parens(item);
+            if matches!(bare, Expr::Lit { kind: LitKind::Nil, .. }) {
+                continue;
+            }
+            if let Expr::SliceLit {
+                elem: None,
+                items: sub_items,
+                ..
+            } = bare
+            {
+                if let TypeExpr::Array { elem: sub_ty, .. }
+                | TypeExpr::Slice { elem: sub_ty, .. } = &resolved_ty
+                {
+                    self.check_slice_lit_items(sub_ty, sub_items);
+                    continue;
+                }
+            }
+            if let Expr::StructLit {
+                ty: None, fields, ..
+            } = bare
+            {
+                if matches!(expected, OpKind::Struct(_))
+                    || (fields.is_empty()
+                        && matches!(
+                            expected,
+                            OpKind::Array(_) | OpKind::Slice(_) | OpKind::Map(_, _)
+                        ))
+                {
+                    continue;
+                }
+            }
+            let ik = self.kind_of_expr(item);
+            if ik == OpKind::Unknown {
+                continue;
+            }
+            if expected == OpKind::Float
+                && ik == OpKind::Int
+                && crate::const_overflow::const_int_value(item).is_some()
+            {
+                continue;
+            }
+            if kinds_conflict(&expected, &ik) {
+                self.emit_e1002(
+                    item.span(),
+                    format!(
+                        "cannot use `{}` (type `{}`) as `{}` value in slice literal (HYB-E1002)",
+                        item.render(),
+                        ik.label(),
+                        elem_ty.render()
+                    ),
+                    "every element of a slice composite literal `[]T{...}` must be assignable to the element type `T`",
+                );
+            }
+        }
+    }
+
+    fn check_map_lit_entries(
+        &mut self,
+        key_ty: &TypeExpr,
+        val_ty: &TypeExpr,
+        entries: &[(Expr, Expr)],
+    ) {
+        let resolved_k = self.ck.resolve_type_alias(key_ty);
+        let resolved_v = self.ck.resolve_type_alias(val_ty);
+        let expected_k = self.kind_of_ty(&resolved_k, 0);
+        let expected_v = self.kind_of_ty(&resolved_v, 0);
+        for (k, v) in entries {
+            self.check_single_value_position(k, "a map literal key", /*binding_position=*/ false);
+            self.check_single_value_position(v, "a map literal value", /*binding_position=*/ false);
+            if expected_k != OpKind::Unknown {
+                let kk = self.kind_of_expr(k);
+                let float_const_ok = expected_k == OpKind::Float
+                    && kk == OpKind::Int
+                    && crate::const_overflow::const_int_value(k).is_some();
+                if kk != OpKind::Unknown && !float_const_ok && kinds_conflict(&expected_k, &kk) {
+                    self.emit_e1002(
+                        k.span(),
+                        format!(
+                            "cannot use `{}` (type `{}`) as `{}` key in map literal (HYB-E1002)",
+                            k.render(),
+                            kk.label(),
+                            key_ty.render()
+                        ),
+                        "every key in `map[K]V{...}` must be assignable to the key type `K`",
+                    );
+                }
+            }
+            if expected_v != OpKind::Unknown {
+                let bare_v = unwrap_parens(v);
+                if matches!(bare_v, Expr::Lit { kind: LitKind::Nil, .. }) {
+                    continue;
+                }
+                if let Expr::StructLit {
+                    ty: None, fields, ..
+                } = bare_v
+                {
+                    if matches!(expected_v, OpKind::Struct(_))
+                        || (fields.is_empty()
+                            && matches!(
+                                expected_v,
+                                OpKind::Array(_) | OpKind::Slice(_) | OpKind::Map(_, _)
+                            ))
+                    {
+                        continue;
+                    }
+                }
+                let vk = self.kind_of_expr(v);
+                let float_const_ok = expected_v == OpKind::Float
+                    && vk == OpKind::Int
+                    && crate::const_overflow::const_int_value(v).is_some();
+                if vk != OpKind::Unknown && !float_const_ok && kinds_conflict(&expected_v, &vk) {
+                    self.emit_e1002(
+                        v.span(),
+                        format!(
+                            "cannot use `{}` (type `{}`) as `{}` value in map literal (HYB-E1002)",
+                            v.render(),
+                            vk.label(),
+                            val_ty.render()
+                        ),
+                        "every value in `map[K]V{...}` must be assignable to the value type `V`",
+                    );
+                }
+            }
+        }
     }
 
     fn check_array_lit_items(&mut self, elem_ty: &TypeExpr, items: &[Expr]) {
@@ -3736,5 +3954,43 @@ fn main() {
             "unexpected diagnostics: {:?}",
             r.diagnostics
         );
+    }
+
+    #[test]
+    fn rejects_task_send_map_key_and_composite_literal_mismatches_issue_887() {
+        for (src, want) in [
+            (
+                "fn two() (int, string) { return 1, \"bad\" }\nfn worker(x int) { fmt.println(x) }\nfn main() { task worker(two()) }\n",
+                "HYB-E2002",
+            ),
+            (
+                "fn two() (int, string) { return 1, \"bad\" }\nfn main() {\n    ch := make(chan int, 1)\n    ch <- two()\n    fmt.println(<-ch)\n}\n",
+                "HYB-E2012",
+            ),
+            (
+                "fn main() {\n    ch := make(chan int, 1)\n    ch <- \"bad\"\n    fmt.println(<-ch)\n}\n",
+                "HYB-E1002",
+            ),
+            (
+                "fn main() {\n    m := map[string]int{\"a\": 1}\n    fmt.println(m[42])\n}\n",
+                "HYB-E1002",
+            ),
+            (
+                "fn main() {\n    s := []int{\"bad\"}\n    fmt.println(len(s))\n}\n",
+                "HYB-E1002",
+            ),
+            (
+                "fn main() {\n    m := map[string]int{123: \"bad\"}\n    fmt.println(len(m))\n}\n",
+                "HYB-E1002",
+            ),
+        ] {
+            let r = check(src);
+            assert_eq!(r.verdict, Verdict::Reject, "expected reject for:\n{src}");
+            assert!(
+                error_codes(&r).contains(&want.to_string()),
+                "expected {want}, got {:?} for:\n{src}",
+                error_codes(&r)
+            );
+        }
     }
 }

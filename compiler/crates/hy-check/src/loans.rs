@@ -3379,19 +3379,65 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            Stmt::Send { chan, value, .. } => {
+                let dst_slots = self.expr_slot_origins(cst, chan, aliases);
+                let src_slots = self.expr_slot_origins(cst, value, aliases);
+                if !dst_slots.is_empty() && !src_slots.is_empty() {
+                    for d in &dst_slots {
+                        for s in &src_slots {
+                            if d != s {
+                                out.insert((*d, *s));
+                            }
+                        }
+                    }
+                    if let Some(c_root) = chan.root_ident() {
+                        if !param_names.contains(c_root) {
+                            aliases
+                                .entry(c_root.to_string())
+                                .or_default()
+                                .extend(src_slots);
+                        }
+                    }
+                }
+            }
             Stmt::For { kind, body, .. } => {
                 let mut body_cst = cst.clone();
                 let mut body_aliases = aliases.clone();
-                if let hy_syntax::ForKind::Iterate { vars, expr } = kind {
-                    let shapes = self.iterate_var_shapes(&body_cst, expr, vars.len());
-                    let raw = Self::raw_expr_slot_origins(expr, &body_aliases);
-                    for (vname, vshape) in vars.iter().zip(shapes) {
-                        let carries =
-                            self.shape_may_share(&vshape) || matches!(vshape, TypeShape::Unknown);
+                let mut loop_bound: HashSet<String> = HashSet::new();
+                match kind {
+                    hy_syntax::ForKind::Iterate { vars, expr } => {
+                        let shapes = self.iterate_var_shapes(&body_cst, expr, vars.len());
+                        let raw = Self::raw_expr_slot_origins(expr, &body_aliases);
+                        for (vname, vshape) in vars.iter().zip(shapes) {
+                            loop_bound.insert(vname.clone());
+                            let carries = self.shape_may_share(&vshape)
+                                || matches!(vshape, TypeShape::Unknown);
+                            body_cst.env_define(
+                                vname,
+                                Binding {
+                                    shape: vshape,
+                                    ty: None,
+                                    immutable: false,
+                                    is_let: false,
+                                    managed_taint: false,
+                                    moved: None,
+                                    non_owned_origin: None,
+                                    slot_loan: false,
+                                },
+                            );
+                            if carries && !raw.is_empty() {
+                                body_aliases.insert(vname.clone(), raw.clone());
+                            } else {
+                                body_aliases.remove(vname);
+                            }
+                        }
+                    }
+                    hy_syntax::ForKind::Range { var, lo, hi, .. } => {
+                        loop_bound.insert(var.clone());
                         body_cst.env_define(
-                            vname,
+                            var,
                             Binding {
-                                shape: vshape,
+                                shape: TypeShape::Primitive,
                                 ty: None,
                                 immutable: false,
                                 is_let: false,
@@ -3401,23 +3447,51 @@ impl<'a> Checker<'a> {
                                 slot_loan: false,
                             },
                         );
-                        if carries && !raw.is_empty() {
-                            body_aliases.insert(vname.clone(), raw.clone());
-                        } else {
-                            body_aliases.remove(vname);
+                        body_aliases.remove(var);
+                        let mut rcalls = Vec::new();
+                        walk::expr_calls(lo, &mut rcalls);
+                        walk::expr_calls(hi, &mut rcalls);
+                        for cr in &rcalls {
+                            self.walk_call_param_stores(
+                                cr,
+                                &body_cst,
+                                &mut body_aliases,
+                                param_names,
+                                depth,
+                                out,
+                            );
                         }
                     }
+                    hy_syntax::ForKind::While { cond } => {
+                        let mut ccalls = Vec::new();
+                        walk::expr_calls(cond, &mut ccalls);
+                        for cr in &ccalls {
+                            self.walk_call_param_stores(
+                                cr,
+                                &body_cst,
+                                &mut body_aliases,
+                                param_names,
+                                depth,
+                                out,
+                            );
+                        }
+                    }
+                    hy_syntax::ForKind::Infinite => {}
                 }
-                self.walk_block_param_stores(
-                    body,
-                    &mut body_cst,
-                    &mut body_aliases,
-                    param_names,
-                    depth,
-                    out,
-                );
+                for _ in 0..2 {
+                    self.walk_block_param_stores(
+                        body,
+                        &mut body_cst,
+                        &mut body_aliases,
+                        param_names,
+                        depth,
+                        out,
+                    );
+                }
                 for (k, v) in body_aliases {
-                    if aliases.contains_key(&k) {
+                    if !loop_bound.contains(&k)
+                        && (aliases.contains_key(&k) || cst.env.contains_key(&k))
+                    {
                         aliases.entry(k).or_default().extend(v);
                     }
                 }
@@ -3431,11 +3505,13 @@ impl<'a> Checker<'a> {
                 for arm in arms {
                     let mut arm_cst = cst.clone();
                     let mut arm_aliases = aliases.clone();
+                    let mut arm_bound: Option<&str> = None;
                     if let hy_syntax::MatchPattern::Path {
                         binding: Some(bname),
                         ..
                     } = &arm.pattern
                     {
+                        arm_bound = Some(bname.as_str());
                         arm_cst.env_define(
                             bname,
                             Binding {
@@ -3464,7 +3540,9 @@ impl<'a> Checker<'a> {
                         out,
                     );
                     for (k, v) in arm_aliases {
-                        if aliases.contains_key(&k) {
+                        if arm_bound != Some(k.as_str())
+                            && (aliases.contains_key(&k) || cst.env.contains_key(&k))
+                        {
                             aliases.entry(k).or_default().extend(v);
                         }
                     }
@@ -3474,6 +3552,85 @@ impl<'a> Checker<'a> {
                 for arm in arms {
                     let mut arm_cst = cst.clone();
                     let mut arm_aliases = aliases.clone();
+                    let mut arm_bound: HashSet<String> = HashSet::new();
+                    match &arm.kind {
+                        hy_syntax::SelectArmKind::Recv { names, chan } => {
+                            let mut ccalls = Vec::new();
+                            walk::expr_calls(chan, &mut ccalls);
+                            for cr in &ccalls {
+                                self.walk_call_param_stores(
+                                    cr,
+                                    &arm_cst,
+                                    &mut arm_aliases,
+                                    param_names,
+                                    depth,
+                                    out,
+                                );
+                            }
+                            let recv_shape = match self.shape_of_expr(&arm_cst, chan) {
+                                TypeShape::Chan(elem) => *elem,
+                                _ => TypeShape::Unknown,
+                            };
+                            let carries = self.shape_may_share(&recv_shape)
+                                || matches!(recv_shape, TypeShape::Unknown);
+                            let recv_origins = if carries {
+                                Self::raw_expr_slot_origins(chan, &arm_aliases)
+                            } else {
+                                HashSet::new()
+                            };
+                            for (idx, n) in names.iter().enumerate() {
+                                arm_bound.insert(n.clone());
+                                let vshape = if idx == 0 {
+                                    recv_shape.clone()
+                                } else {
+                                    TypeShape::Primitive
+                                };
+                                arm_cst.env_define(
+                                    n,
+                                    Binding {
+                                        shape: vshape,
+                                        ty: None,
+                                        immutable: false,
+                                        is_let: false,
+                                        managed_taint: false,
+                                        moved: None,
+                                        non_owned_origin: None,
+                                        slot_loan: false,
+                                    },
+                                );
+                                if idx == 0 && !recv_origins.is_empty() {
+                                    arm_aliases.insert(n.clone(), recv_origins.clone());
+                                } else {
+                                    arm_aliases.remove(n);
+                                }
+                            }
+                        }
+                        hy_syntax::SelectArmKind::Send { chan, value, .. } => {
+                            let mut ccalls = Vec::new();
+                            walk::expr_calls(chan, &mut ccalls);
+                            walk::expr_calls(value, &mut ccalls);
+                            for cr in &ccalls {
+                                self.walk_call_param_stores(
+                                    cr,
+                                    &arm_cst,
+                                    &mut arm_aliases,
+                                    param_names,
+                                    depth,
+                                    out,
+                                );
+                            }
+                            let dst_slots = self.expr_slot_origins(&arm_cst, chan, &arm_aliases);
+                            let src_slots = self.expr_slot_origins(&arm_cst, value, &arm_aliases);
+                            for d in &dst_slots {
+                                for s in &src_slots {
+                                    if d != s {
+                                        out.insert((*d, *s));
+                                    }
+                                }
+                            }
+                        }
+                        hy_syntax::SelectArmKind::Default => {}
+                    }
                     self.walk_block_param_stores(
                         &arm.body,
                         &mut arm_cst,
@@ -3483,7 +3640,9 @@ impl<'a> Checker<'a> {
                         out,
                     );
                     for (k, v) in arm_aliases {
-                        if aliases.contains_key(&k) {
+                        if !arm_bound.contains(&k)
+                            && (aliases.contains_key(&k) || cst.env.contains_key(&k))
+                        {
                             aliases.entry(k).or_default().extend(v);
                         }
                     }
@@ -8629,5 +8788,58 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn walk_stmt_param_stores_tracks_for_match_select_and_send() {
+        let src_for_predeclared = "\
+fn stash_loop(dst []map[string]int, src map[string]int) {
+    var alias map[string]int
+    for i in 0..1 {
+        alias = src
+    }
+    dst[0] = alias
 }
+
+fn main() {
+    m := map[string]int{\"a\": 1}
+    dst := []map[string]int{{}}
+    stash_loop(dst, m)
+    ch := make(chan []map[string]int, 1)
+    ch <- move dst
+    m[\"a\"] = 2
+}
+";
+        assert!(
+            check_codes(src_for_predeclared).iter().any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when callee assigns pre-declared local inside for loop and stores into dst"
+        );
+
+        let src_select_recv = "\
+fn stash_select(dst []map[string]int, ch chan map[string]int) {
+    select {
+        v := <-ch: {
+            dst[0] = v
+        }
+        default: {
+        }
+    }
+}
+
+fn main() {
+    ch := make(chan map[string]int, 1)
+    dst := []map[string]int{{}}
+    stash_select(dst, ch)
+    out := make(chan []map[string]int, 1)
+    out <- move dst
+    _ = <-ch
+}
+";
+        assert!(
+            check_codes(src_select_recv).iter().any(|c| c == "HYB-E3003" || c == "HYB-E3004"),
+            "expected HYB-E3003 or HYB-E3004 when callee receives from chan parameter in select arm and stores into dst"
+        );
+    }
+}
+
+
 

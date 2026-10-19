@@ -1606,13 +1606,82 @@ fn inspect_later_defer_fate(
     defer_idx: usize,
     name: &str,
 ) -> LaterDeferFate {
-    let mut pre_peers: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
-    for (stmt, idx) in &flat.stmts {
+    // Determine which `ScopeEvent::Push` events before `defer_idx` remain open
+    // at `defer_idx` (enclosing scopes of the `defer`) versus transient inner
+    // scopes that close on or before `defer_idx`.
+    let mut open_push_ids: Vec<usize> = Vec::new();
+    let mut push_seq = 0usize;
+    for (_, idx) in &flat.stmts {
+        if let Some(evs) = flat.events.get(idx) {
+            for ev in evs {
+                match ev {
+                    crate::walk::ScopeEvent::Push => {
+                        open_push_ids.push(push_seq);
+                        push_seq += 1;
+                    }
+                    crate::walk::ScopeEvent::Pop => {
+                        open_push_ids.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
         if *idx >= defer_idx {
             break;
         }
-        update_pre_defer_peers(ck, st, stmt, &mut pre_peers);
+    }
+    let enclosing_pushes: std::collections::HashSet<usize> =
+        open_push_ids.into_iter().collect();
+
+    let mut pre_peers: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut pre_transient_shadows: Vec<std::collections::HashSet<String>> = Vec::new();
+    let mut cur_push_seq = 0usize;
+    for (stmt, idx) in &flat.stmts {
+        if let Some(evs) = flat.events.get(idx) {
+            for ev in evs {
+                match ev {
+                    crate::walk::ScopeEvent::Push => {
+                        let pid = cur_push_seq;
+                        cur_push_seq += 1;
+                        if !enclosing_pushes.contains(&pid) {
+                            pre_transient_shadows.push(std::collections::HashSet::new());
+                        }
+                    }
+                    crate::walk::ScopeEvent::Pop => {
+                        pre_transient_shadows.pop();
+                    }
+                    crate::walk::ScopeEvent::SelectRecv { names, .. } => {
+                        if let Some(top) = pre_transient_shadows.last_mut() {
+                            for n in names {
+                                top.insert(n.clone());
+                            }
+                        }
+                    }
+                    crate::walk::ScopeEvent::MatchBind {
+                        name: bname,
+                        subject,
+                    } => {
+                        let mut refs = Vec::new();
+                        expr_referenced_bindings(subject, &mut refs);
+                        if pre_transient_shadows.is_empty() {
+                            sever_peer_node(&mut pre_peers, bname);
+                        } else if let Some(top) = pre_transient_shadows.last_mut() {
+                            top.insert((*bname).to_string());
+                        }
+                        for r in refs {
+                            if !pre_transient_shadows.iter().any(|s| s.contains(&r)) {
+                                link_peer_nodes(&mut pre_peers, bname, &r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if *idx >= defer_idx {
+            break;
+        }
+        update_pre_defer_peers(ck, st, stmt, &mut pre_peers, &mut pre_transient_shadows);
     }
 
     let root = crate::freeze::resolve_alias(st, name);
@@ -1636,14 +1705,67 @@ fn inspect_later_defer_fate(
     }
 
     let mut rebound_self = false;
+    let mut post_shadow_scopes: Vec<std::collections::HashSet<String>> = Vec::new();
     for (stmt, idx) in &flat.stmts {
-        if *idx <= defer_idx || flat.in_managed(*idx) {
+        if *idx <= defer_idx {
             continue;
         }
-        if let Some(mv) = stmt_moves_watched_binding(stmt, &watch) {
+        if let Some(evs) = flat.events.get(idx) {
+            for ev in evs {
+                match ev {
+                    crate::walk::ScopeEvent::Push => {
+                        post_shadow_scopes.push(std::collections::HashSet::new());
+                    }
+                    crate::walk::ScopeEvent::Pop => {
+                        post_shadow_scopes.pop();
+                    }
+                    crate::walk::ScopeEvent::SelectRecv { names, .. } => {
+                        if let Some(top) = post_shadow_scopes.last_mut() {
+                            for n in names {
+                                top.insert(n.clone());
+                            }
+                        }
+                    }
+                    crate::walk::ScopeEvent::MatchBind {
+                        name: bname,
+                        subject,
+                    } => {
+                        let reads_watched = watch
+                            .iter()
+                            .filter(|w| !post_shadow_scopes.iter().any(|s| s.contains(*w)))
+                            .any(|w| ck.value_reads_storage_of(st, subject, w));
+                        if reads_watched {
+                            if let Some(top) = post_shadow_scopes.last_mut() {
+                                top.remove(*bname);
+                            }
+                            watch.insert((*bname).to_string());
+                        } else if let Some(top) = post_shadow_scopes.last_mut() {
+                            top.insert((*bname).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if flat.in_managed(*idx) {
+            continue;
+        }
+        let active_watch: std::collections::HashSet<String> = watch
+            .iter()
+            .filter(|w| !post_shadow_scopes.iter().any(|s| s.contains(*w)))
+            .cloned()
+            .collect();
+        if let Some(mv) = stmt_moves_watched_binding(stmt, &active_watch) {
             return LaterDeferFate::Moved(mv);
         }
-        update_post_defer_watch(ck, st, stmt, name, &mut watch, &mut rebound_self);
+        update_post_defer_watch(
+            ck,
+            st,
+            stmt,
+            name,
+            &mut watch,
+            &mut post_shadow_scopes,
+            &mut rebound_self,
+        );
     }
     if rebound_self {
         LaterDeferFate::ReboundBeforeMove
@@ -1705,7 +1827,30 @@ fn update_pre_defer_peers(
     st: &FnState,
     stmt: &Stmt,
     peers: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    transient_shadows: &mut [std::collections::HashSet<String>],
 ) {
+    let is_shadowed =
+        |name: &str, shadows: &[std::collections::HashSet<String>]| shadows.iter().any(|s| s.contains(name));
+    let mut calls = Vec::new();
+    crate::walk::own_calls(stmt, &mut calls);
+    for cr in &calls {
+        if let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) {
+            if name == "copy" && cr.args.len() >= 2 {
+                if let Some(dst_root) = crate::model::unwrap_parens(&cr.args[0].value).root_ident() {
+                    if !is_shadowed(dst_root, transient_shadows) {
+                        let mut refs = Vec::new();
+                        expr_referenced_bindings(&cr.args[1].value, &mut refs);
+                        for r in refs {
+                            if !is_shadowed(&r, transient_shadows) {
+                                link_peer_nodes(peers, dst_root, &r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     match stmt {
         Stmt::Local(l) => {
             for (i, target) in l.names.iter().enumerate() {
@@ -1717,17 +1862,37 @@ fn update_pre_defer_peers(
                 if let Some(v) = val {
                     expr_referenced_bindings(v, &mut refs);
                 }
-                let self_read = val.is_some_and(|v| ck.value_reads_storage_of(st, v, target));
-                if !self_read {
-                    sever_peer_node(peers, target);
-                }
-                for r in refs {
-                    let may_share = ck
-                        .lookup_binding(st, &r)
-                        .map(|b| ck.shape_may_share(&b.shape))
-                        .unwrap_or(true);
-                    if may_share {
-                        link_peer_nodes(peers, target, &r);
+                let self_read = !is_shadowed(target, transient_shadows)
+                    && val.is_some_and(|v| ck.value_reads_storage_of(st, v, target));
+                if transient_shadows.is_empty() {
+                    if !self_read {
+                        sever_peer_node(peers, target);
+                    }
+                    for r in refs {
+                        let may_share = ck
+                            .lookup_binding(st, &r)
+                            .map(|b| ck.shape_may_share(&b.shape))
+                            .unwrap_or(true);
+                        if may_share {
+                            link_peer_nodes(peers, target, &r);
+                        }
+                    }
+                } else {
+                    let active_refs: Vec<String> = refs
+                        .into_iter()
+                        .filter(|r| !is_shadowed(r, transient_shadows))
+                        .collect();
+                    if active_refs.is_empty() && !self_read {
+                        if let Some(top) = transient_shadows.last_mut() {
+                            top.insert(target.clone());
+                        }
+                    } else {
+                        if let Some(top) = transient_shadows.last_mut() {
+                            top.remove(target);
+                        }
+                        for r in active_refs {
+                            link_peer_nodes(peers, target, &r);
+                        }
                     }
                 }
             }
@@ -1746,42 +1911,96 @@ fn update_pre_defer_peers(
             ..
         } => {
             for (i, t) in targets.iter().enumerate() {
-                if let hy_syntax::PlaceKind::Ident(target) = &t.kind {
-                    if target == "_" {
-                        continue;
-                    }
-                    let val = values.get(i).or_else(|| values.first());
-                    let mut refs = Vec::new();
-                    if let Some(v) = val {
-                        expr_referenced_bindings(v, &mut refs);
-                    }
-                    let self_read = val.is_some_and(|v| ck.value_reads_storage_of(st, v, target));
-                    if !self_read {
-                        sever_peer_node(peers, target);
-                    }
-                    for r in refs {
-                        let may_share = ck
-                            .lookup_binding(st, &r)
-                            .map(|b| ck.shape_may_share(&b.shape))
-                            .unwrap_or(true);
-                        if may_share {
-                            link_peer_nodes(peers, target, &r);
+                let val = values.get(i).or_else(|| values.first());
+                let mut refs = Vec::new();
+                if let Some(v) = val {
+                    expr_referenced_bindings(v, &mut refs);
+                }
+                match &t.kind {
+                    hy_syntax::PlaceKind::Ident(target) => {
+                        if target == "_" || is_shadowed(target, transient_shadows) {
+                            continue;
+                        }
+                        let self_read =
+                            val.is_some_and(|v| ck.value_reads_storage_of(st, v, target));
+                        if transient_shadows.is_empty() && !self_read {
+                            sever_peer_node(peers, target);
+                        }
+                        for r in refs {
+                            if is_shadowed(&r, transient_shadows) {
+                                continue;
+                            }
+                            let may_share = ck
+                                .lookup_binding(st, &r)
+                                .map(|b| ck.shape_may_share(&b.shape))
+                                .unwrap_or(true);
+                            if may_share {
+                                link_peer_nodes(peers, target, &r);
+                            }
                         }
                     }
+                    hy_syntax::PlaceKind::Field { .. } | hy_syntax::PlaceKind::Index { .. } => {
+                        let root = t.root();
+                        if !root.is_empty() && !is_shadowed(root, transient_shadows) {
+                            for r in refs {
+                                if !is_shadowed(&r, transient_shadows) {
+                                    link_peer_nodes(peers, root, &r);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             if values.len() == 1 && targets.len() > 1 {
                 for (i, j) in ck.callee_shared_return_pairs(st, &values[0]) {
                     if let (Some(ta), Some(tb)) = (targets.get(i), targets.get(j)) {
-                        if let (
-                            hy_syntax::PlaceKind::Ident(a),
-                            hy_syntax::PlaceKind::Ident(b),
-                        ) = (&ta.kind, &tb.kind)
-                        {
+                        let a = match &ta.kind {
+                            hy_syntax::PlaceKind::Ident(n) => n.as_str(),
+                            _ => ta.root(),
+                        };
+                        let b = match &tb.kind {
+                            hy_syntax::PlaceKind::Ident(n) => n.as_str(),
+                            _ => tb.root(),
+                        };
+                        if !a.is_empty() && !b.is_empty() {
                             link_peer_nodes(peers, a, b);
                         }
                     }
                 }
+            }
+        }
+        Stmt::For {
+            kind: Iterate { vars, expr },
+            ..
+        } => {
+            let mut refs = Vec::new();
+            expr_referenced_bindings(expr, &mut refs);
+            let active_refs: Vec<String> = refs
+                .into_iter()
+                .filter(|r| !is_shadowed(r, transient_shadows))
+                .collect();
+            for v in vars {
+                if v == "_" {
+                    continue;
+                }
+                if active_refs.is_empty() {
+                    if let Some(top) = transient_shadows.last_mut() {
+                        top.insert(v.clone());
+                    }
+                } else {
+                    for r in &active_refs {
+                        link_peer_nodes(peers, v, r);
+                    }
+                }
+            }
+        }
+        Stmt::For {
+            kind: Range { var, .. },
+            ..
+        } => {
+            if let Some(top) = transient_shadows.last_mut() {
+                top.insert(var.clone());
             }
         }
         _ => {}
@@ -1794,21 +2013,67 @@ fn update_post_defer_watch(
     stmt: &Stmt,
     deferred_name: &str,
     watch: &mut std::collections::HashSet<String>,
+    shadow_scopes: &mut [std::collections::HashSet<String>],
     rebound_self: &mut bool,
 ) {
-    let mut handle_bind = |target: &str, val: Option<&Expr>| {
+    let expr_reads_active_watch =
+        |v: &Expr,
+         watch: &std::collections::HashSet<String>,
+         shadow_scopes: &[std::collections::HashSet<String>]| {
+            watch
+                .iter()
+                .filter(|w| !shadow_scopes.iter().any(|s| s.contains(*w)))
+                .any(|w| ck.value_reads_storage_of(st, v, w))
+        };
+
+    let mut calls = Vec::new();
+    crate::walk::own_calls(stmt, &mut calls);
+    for cr in &calls {
+        if let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) {
+            if name == "copy"
+                && cr.args.len() >= 2
+                && expr_reads_active_watch(&cr.args[1].value, watch, shadow_scopes)
+            {
+                if let Some(dst_root) = crate::model::unwrap_parens(&cr.args[0].value).root_ident() {
+                    if !shadow_scopes.iter().any(|s| s.contains(dst_root)) {
+                        watch.insert(dst_root.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut handle_bind = |target: &str, val: Option<&Expr>, is_local_decl: bool| {
         if target == "_" {
             return;
         }
-        let Some(v) = val else {
+        let reads_watched =
+            val.is_some_and(|v| expr_reads_active_watch(v, watch, shadow_scopes));
+        if is_local_decl && !shadow_scopes.is_empty() {
+            if reads_watched {
+                if let Some(top) = shadow_scopes.last_mut() {
+                    top.remove(target);
+                }
+                watch.insert(target.to_string());
+            } else if let Some(top) = shadow_scopes.last_mut() {
+                top.insert(target.to_string());
+            }
+            return;
+        }
+        let Some(_) = val else {
+            if is_local_decl && shadow_scopes.is_empty() {
+                watch.remove(target);
+                if target == deferred_name {
+                    *rebound_self = true;
+                }
+            }
             return;
         };
-        let reads_watched = watch
-            .iter()
-            .any(|w| ck.value_reads_storage_of(st, v, w));
         if reads_watched {
-            watch.insert(target.to_string());
-        } else {
+            if !shadow_scopes.iter().any(|s| s.contains(target)) {
+                watch.insert(target.to_string());
+            }
+        } else if shadow_scopes.is_empty() {
             watch.remove(target);
             if target == deferred_name {
                 *rebound_self = true;
@@ -1820,7 +2085,17 @@ fn update_post_defer_watch(
         Stmt::Local(l) => {
             for (i, target) in l.names.iter().enumerate() {
                 let val = l.values.get(i).or_else(|| l.values.first());
-                handle_bind(target, val);
+                handle_bind(target, val, true);
+            }
+            if l.values.len() == 1 && l.names.len() > 1 {
+                for (i, j) in ck.callee_shared_return_pairs(st, &l.values[0]) {
+                    if let (Some(a), Some(b)) = (l.names.get(i), l.names.get(j)) {
+                        if watch.contains(a) || watch.contains(b) {
+                            watch.insert(a.clone());
+                            watch.insert(b.clone());
+                        }
+                    }
+                }
             }
         }
         Stmt::Assign {
@@ -1830,10 +2105,57 @@ fn update_post_defer_watch(
             ..
         } => {
             for (i, t) in targets.iter().enumerate() {
-                if let hy_syntax::PlaceKind::Ident(target) = &t.kind {
-                    let val = values.get(i).or_else(|| values.first());
-                    handle_bind(target, val);
+                let val = values.get(i).or_else(|| values.first());
+                match &t.kind {
+                    hy_syntax::PlaceKind::Ident(target) => {
+                        handle_bind(target, val, false);
+                    }
+                    hy_syntax::PlaceKind::Field { .. } | hy_syntax::PlaceKind::Index { .. } => {
+                        let root = t.root();
+                        if !root.is_empty()
+                            && !shadow_scopes.iter().any(|s| s.contains(root))
+                            && val.is_some_and(|v| expr_reads_active_watch(v, watch, shadow_scopes))
+                        {
+                            watch.insert(root.to_string());
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            if values.len() == 1 && targets.len() > 1 {
+                for (i, j) in ck.callee_shared_return_pairs(st, &values[0]) {
+                    if let (Some(ta), Some(tb)) = (targets.get(i), targets.get(j)) {
+                        let a = match &ta.kind {
+                            hy_syntax::PlaceKind::Ident(n) => n.as_str(),
+                            _ => ta.root(),
+                        };
+                        let b = match &tb.kind {
+                            hy_syntax::PlaceKind::Ident(n) => n.as_str(),
+                            _ => tb.root(),
+                        };
+                        if !a.is_empty() && !b.is_empty() && (watch.contains(a) || watch.contains(b))
+                        {
+                            watch.insert(a.to_string());
+                            watch.insert(b.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::For {
+            kind: Iterate { vars, expr },
+            ..
+        } => {
+            for v in vars {
+                handle_bind(v, Some(expr), true);
+            }
+        }
+        Stmt::For {
+            kind: Range { var, .. },
+            ..
+        } => {
+            if let Some(top) = shadow_scopes.last_mut() {
+                top.insert(var.clone());
             }
         }
         _ => {}
@@ -2097,5 +2419,73 @@ fn main() {
 }
 "#;
         assert_eq!(codes(src), vec!["HYB-E3003"]);
+    }
+
+    #[test]
+    fn reject_defer_when_shadowed_branch_rebound_or_field_aliased_before_move() {
+        let src = r#"import "fmt"
+
+struct holder {
+    m map[string]int
+}
+
+fn worker(owned map[string]int) {
+    owned["k"] = 2
+}
+
+fn worker_holder(h holder) {
+    h.m["k"] = 2
+}
+
+fn report(m map[string]int) {
+    fmt.println(m["k"])
+}
+
+fn case_post_shadow() {
+    shared := map[string]int{"k": 1}
+    defer report(shared)
+    if true {
+        shared := 0
+        _ = shared
+    }
+    task worker(move shared)
+}
+
+fn case_branch_rebind(cond bool) {
+    shared := map[string]int{"k": 1}
+    defer report(shared)
+    if cond {
+        shared = map[string]int{"k": 2}
+    }
+    task worker(move shared)
+}
+
+fn case_field_alias() {
+    shared := map[string]int{"k": 1}
+    defer report(shared)
+    h := holder{m: map[string]int{}}
+    h.m = shared
+    shared = map[string]int{"k": 2}
+    _ = shared
+    task worker_holder(move h)
+}
+
+fn case_pre_shadow() {
+    shared := map[string]int{"k": 1}
+    alias := shared
+    if true {
+        shared := 0
+        _ = shared
+    }
+    defer report(shared)
+    shared = map[string]int{"k": 2}
+    _ = shared
+    task worker(move alias)
+}
+"#;
+        assert_eq!(
+            codes(src),
+            vec!["HYB-E3003", "HYB-E3003", "HYB-E3003", "HYB-E3003"]
+        );
     }
 }

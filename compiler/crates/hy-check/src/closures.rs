@@ -457,7 +457,13 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
     } else {
         crate::walk::own_calls(stmt, &mut calls);
     }
+    let mut stmt_consumes: Vec<(String, String, hy_diagnostics::Span)> = Vec::new();
     for cr in &calls {
+        let saved_loans_len = st.loans.len();
+        let saved_diags_len = ck.diags.len();
+        ck.process_call(st, cr, 0, None, &mut stmt_consumes);
+        st.loans.truncate(saved_loans_len);
+        ck.diags.truncate(saved_diags_len);
         if let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) {
             if name == "copy" {
                 ck.record_copy_may_share(st, cr);
@@ -465,6 +471,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
         }
         ck.record_callee_param_stores(st, cr);
     }
+    ck.check_same_stmt_consumes(st, &uses, &stmt_consumes);
     // Issue #288 integration: closure bodies sit outside the Tier-0 flat
     // walk, where builtins.rs owns the HYB-E2001 defer-operand rule — so a
     // `defer 3` one scope in passed main with 0 diagnostics and failed late
@@ -1204,24 +1211,54 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
 
 /// Check A3 (`HYB-E3102`) for map-slot loans opened inside a closure body.
 fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block) {
-    use crate::model::{Loan, LoanTarget};
+    use crate::model::{Loan, LoanTarget, TypeShape};
     use crate::walk;
     let flat = walk::flatten(body);
     let saved_last_use = std::mem::replace(&mut st.last_use, flat.last_use.clone());
     let saved_loop_end = std::mem::replace(&mut st.loop_end, flat.loop_end.clone());
     let saved_loans = std::mem::take(&mut st.loans);
+    let saved_env = st.env.clone();
+    let saved_scopes = st.scopes.clone();
     for (stmt, idx) in &flat.stmts {
         let idx = *idx;
+        let loop_end = st.loop_end.get(&idx).copied();
         let mut calls = Vec::new();
-        walk::own_calls(stmt, &mut calls);
+        if let Stmt::For {
+            kind: Iterate { expr, .. },
+            ..
+        } = stmt
+        {
+            walk::expr_calls(expr, &mut calls);
+        } else {
+            walk::own_calls(stmt, &mut calls);
+        }
         for cr in calls {
             let mut dummy_consumes = Vec::new();
-            ck.process_call(st, &cr, idx, None, &mut dummy_consumes);
+            ck.process_call(st, &cr, idx, loop_end, &mut dummy_consumes);
         }
         match stmt {
             Stmt::Local(l) => {
                 if l.names.len() == l.values.len() {
                     for (name, val) in l.names.iter().zip(l.values.iter()) {
+                        let shape = l
+                            .ty
+                            .as_ref()
+                            .map(|t| ck.shape_of_type(t))
+                            .unwrap_or_else(|| ck.shape_of_expr(st, val));
+                        if name != "_" && ck.lookup_binding(st, name).is_none() {
+                            ck.define_binding(
+                                st,
+                                name,
+                                shape.clone(),
+                                l.ty.clone().or_else(|| ck.ty_of_expr(st, val)),
+                                matches!(l.kind, LocalKind::Const),
+                                matches!(l.kind, LocalKind::Let),
+                                false,
+                            );
+                        }
+                        if matches!(shape, TypeShape::BorrowHandle(_)) {
+                            ck.extend_call_loans_to_view(st, val, name, idx);
+                        }
                         if let Some(path) = walk::addr_of_index_base_path(val) {
                             let binding = name.clone();
                             let key = walk::addr_of_index_slot_key(val);
@@ -1252,6 +1289,13 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                 if *op == hy_syntax::AssignOp::Assign && targets.len() == values.len() {
                     for (t, v) in targets.iter().zip(values.iter()) {
                         if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                            let shape = ck
+                                .lookup_binding(st, name)
+                                .map(|b| b.shape.clone())
+                                .unwrap_or_else(|| ck.shape_of_expr(st, v));
+                            if matches!(shape, TypeShape::BorrowHandle(_)) {
+                                ck.extend_call_loans_to_view(st, v, name, idx);
+                            }
                             if let Some(path) = walk::addr_of_index_base_path(v) {
                                 let binding = name.clone();
                                 let key = walk::addr_of_index_slot_key(v);
@@ -1285,6 +1329,8 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
             _ => {}
         }
     }
+    st.scopes = saved_scopes;
+    st.env = saved_env;
     st.loans = saved_loans;
     st.loop_end = saved_loop_end;
     st.last_use = saved_last_use;

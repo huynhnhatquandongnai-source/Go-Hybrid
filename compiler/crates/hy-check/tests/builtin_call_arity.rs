@@ -84,6 +84,17 @@ fn real_and_imag_bad_arity_rejects_e2005() {
 }
 
 #[test]
+fn append_zero_or_one_arg_rejects_e2005() {
+    let r0 = check("fn main() {\n    x := append()\n    _ = x\n}\n");
+    assert_eq!(r0.verdict, Verdict::Reject);
+    assert!(error_codes(&r0).contains(&"HYB-E2005".to_string()));
+
+    let r1 = check("fn main() {\n    s := []int{1, 2}\n    x := append(s)\n    _ = x\n}\n");
+    assert_eq!(r1.verdict, Verdict::Reject);
+    assert!(error_codes(&r1).contains(&"HYB-E2005".to_string()));
+}
+
+#[test]
 fn closure_panic_bad_arity_rejects_e2005() {
     let src = "fn main() {\n    f := fn() {\n        panic()\n    }\n    _ = f\n}\n";
     let r = check(src);
@@ -103,7 +114,12 @@ fn main() {
     c := complex(1.0, 2.0)
     re := real(c)
     im := imag(c)
+    s := []int{1, 2}
+    s2 := append(s, 3)
+    s3 := append(s, 4, 5)
     _ = r
+    _ = s2
+    _ = s3
     _ = m1
     _ = m2
     _ = m3

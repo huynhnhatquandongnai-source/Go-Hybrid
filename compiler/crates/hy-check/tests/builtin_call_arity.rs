@@ -132,3 +132,63 @@ fn main() {
     assert_eq!(r.verdict, Verdict::Accept);
     assert!(error_codes(&r).is_empty(), "expected 0 errors, got {:?}", r.diagnostics);
 }
+
+#[test]
+fn min_max_nil_literal_rejects_e2005() {
+    let r_min = check("fn main() {\n    _ = min(nil)\n}\n");
+    assert_eq!(r_min.verdict, Verdict::Reject);
+    assert!(error_codes(&r_min).contains(&"HYB-E2005".to_string()));
+
+    let r_max = check("fn main() {\n    _ = max(nil)\n}\n");
+    assert_eq!(r_max.verdict, Verdict::Reject);
+    assert!(error_codes(&r_max).contains(&"HYB-E2005".to_string()));
+}
+
+#[test]
+fn real_imag_invalid_literal_rejects_e2005() {
+    let r1 = check("fn main() {\n    _ = real(\"bad\")\n}\n");
+    assert_eq!(r1.verdict, Verdict::Reject);
+    assert!(error_codes(&r1).contains(&"HYB-E2005".to_string()));
+
+    let r2 = check("fn main() {\n    _ = real(nil)\n}\n");
+    assert_eq!(r2.verdict, Verdict::Reject);
+    assert!(error_codes(&r2).contains(&"HYB-E2005".to_string()));
+
+    let r3 = check("fn main() {\n    _ = imag(true)\n}\n");
+    assert_eq!(r3.verdict, Verdict::Reject);
+    assert!(error_codes(&r3).contains(&"HYB-E2005".to_string()));
+
+    let r4 = check("fn main() {\n    _ = imag(nil)\n}\n");
+    assert_eq!(r4.verdict, Verdict::Reject);
+    assert!(error_codes(&r4).contains(&"HYB-E2005".to_string()));
+}
+
+#[test]
+fn complex_invalid_literal_rejects_e2005() {
+    let r1 = check("fn main() {\n    _ = complex(\"x\", \"y\")\n}\n");
+    assert_eq!(r1.verdict, Verdict::Reject);
+    assert!(error_codes(&r1).contains(&"HYB-E2005".to_string()));
+
+    let r2 = check("fn main() {\n    _ = complex(nil, nil)\n}\n");
+    assert_eq!(r2.verdict, Verdict::Reject);
+    assert!(error_codes(&r2).contains(&"HYB-E2005".to_string()));
+
+    let r3 = check("fn main() {\n    _ = complex(true, false)\n}\n");
+    assert_eq!(r3.verdict, Verdict::Reject);
+    assert!(error_codes(&r3).contains(&"HYB-E2005".to_string()));
+}
+
+#[test]
+fn complex_type_conversion_invalid_literal_rejects() {
+    let r1 = check("fn main() {\n    _ = complex128(\"invalid\")\n}\n");
+    assert_eq!(r1.verdict, Verdict::Reject);
+
+    let r2 = check("fn main() {\n    _ = complex128(true)\n}\n");
+    assert_eq!(r2.verdict, Verdict::Reject);
+
+    let r3 = check("fn main() {\n    _ = complex128(nil)\n}\n");
+    assert_eq!(r3.verdict, Verdict::Reject);
+
+    let r4 = check("fn main() {\n    _ = complex64(nil)\n}\n");
+    assert_eq!(r4.verdict, Verdict::Reject);
+}
